@@ -82,7 +82,7 @@ function Load-Library {
         if ($d.dat) { foreach ($p in $d.dat.PSObject.Properties) { $script:datCache[$p.Name] = @{ L = "$($p.Value.L)"; V = "$($p.Value.V)" } } }
         $games = @()
         foreach ($r in @($d.games)) {
-            if (-not $r.Dir -or -not (Test-Path -LiteralPath $r.Dir)) { continue }
+            if (-not $r.Dir -or -not (Test-Path -LiteralPath $r.Dir) -or "$($r.Tags)" -eq 'Inno') { continue }
             $script:exeCache[$r.Key] = $r.Exe
             $rec = [pscustomobject]@{ Key = $r.Key; KeyPath = $r.KeyPath; Name = $r.Name; Dir = $r.Dir; UnExe = $r.UnExe; Tags = @("$($r.Tags)" -split ','); IconSrc = $r.IconSrc; Version = $r.Version; Date = $r.Date }
             $g = New-Game $rec
@@ -174,8 +174,7 @@ function Scan {
             elseif ($inno) {
                 $dat = if ($unExe) { Join-Path (Split-Path $unExe -Parent) ([IO.Path]::GetFileNameWithoutExtension($unExe) + '.dat') } else { $null }
                 $t = if ($dat) { Get-InnoTag $dat } else { 'Inno' }
-                $tags = @($t)
-                if ($t -eq 'Inno' -and $script:cfg["tag:$name"]) { $tags = @('Repack') }
+                if ($t -eq 'Inno') { if ($script:cfg["tag:$name"]) { $tags = @('Repack') } else { continue } } else { $tags = @($t) }
             }
             if (-not $tags) { continue }
             $dir = $p.InstallLocation.Trim('"', ' ', '\')
@@ -298,47 +297,120 @@ function Start-Bg($sb, $jobs, $track = $true) {
 }
 
 # ---------- UI ----------
+# ---------- theming (defaults = the original dark look) ----------
+$Themes = @{
+    Dark     = @{ Bg = '#1B1B1D'; Panel = '#242427'; Panel2 = '#2F2F34'; Card = '#2B2B2E'; Btn = '#38383C'; Hover = '#2E2E32'; Text = '#F3F3F3'; Sub = '#B4B4B8'; Muted = '#808085'; ChipText = '#DDDDDD'; Thumb = '#5A5A5F'; IsDark = $true }
+    Midnight = @{ Bg = '#000000'; Panel = '#0C0C0E'; Panel2 = '#141417'; Card = '#131316'; Btn = '#1F1F23'; Hover = '#18181B'; Text = '#F3F3F3'; Sub = '#A2A2A8'; Muted = '#6F6F78'; ChipText = '#D0D0D0'; Thumb = '#3A3A40'; IsDark = $true }
+    Slate    = @{ Bg = '#151A21'; Panel = '#1C232C'; Panel2 = '#232C37'; Card = '#212A35'; Btn = '#2E3846'; Hover = '#263140'; Text = '#E8EEF5'; Sub = '#A9B6C6'; Muted = '#77869A'; ChipText = '#D3DCE8'; Thumb = '#455063'; IsDark = $true }
+    Light    = @{ Bg = '#F1F1F5'; Panel = '#FFFFFF'; Panel2 = '#FFFFFF'; Card = '#E4E4EA'; Btn = '#D9D9E0'; Hover = '#E8E8EE'; Text = '#1B1B1D'; Sub = '#55555C'; Muted = '#7B7B84'; ChipText = '#33333A'; Thumb = '#B5B5BC'; IsDark = $false }
+}
+$Accents = '#60CDFF', '#7C83FF', '#C77DFF', '#FF6B9D', '#FF8A4C', '#FFC83D', '#3DDC97', '#2DD4BF'
+$script:animOn = $true; $script:syncing = $false
+function New-Brush($hex) { $b = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)); $b.Freeze(); $b }
+function Mix($a, $b, $f) {
+    $x = [Windows.Media.ColorConverter]::ConvertFromString($a); $y = [Windows.Media.ColorConverter]::ConvertFromString($b)
+    [Windows.Media.Color]::FromRgb([byte][Math]::Round($x.R + ($y.R - $x.R) * $f), [byte][Math]::Round($x.G + ($y.G - $x.G) * $f), [byte][Math]::Round($x.B + ($y.B - $x.B) * $f))
+}
+function Set-TitleBar {
+    if (-not $w) { return }
+    $h = (New-Object Windows.Interop.WindowInteropHelper $w).Handle
+    if ($h -eq [IntPtr]::Zero) { return }
+    $v = if ($script:themeDark) { 1 } else { 0 }; [void][Dwm]::DwmSetWindowAttribute($h, 20, [ref]$v, 4)
+    $col = [Windows.Media.ColorConverter]::ConvertFromString($script:themeBg); $c = [int]$col.R + ([int]$col.G * 256) + ([int]$col.B * 65536)
+    [void][Dwm]::DwmSetWindowAttribute($h, 35, [ref]$c, 4)
+}
+function Apply-Theme {
+    $tn = "$($script:cfg['ui:theme'])"; if (-not $Themes.ContainsKey($tn)) { $tn = 'Dark' }
+    $t = $Themes[$tn]
+    $acc = "$($script:cfg['ui:accent'])"; if ($acc -notmatch '^#[0-9A-Fa-f]{6}$') { $acc = '#60CDFF' }
+    $r = $app.Resources
+    foreach ($k in 'Text', 'Sub', 'Muted', 'ChipText', 'Thumb', 'Card', 'Btn', 'Hover', 'Panel', 'Panel2') { $r["Ui$k"] = New-Brush $t[$k] }
+    $r['UiAccent'] = New-Brush $acc
+    $c = [Windows.Media.ColorConverter]::ConvertFromString($acc)
+    $r['UiAccentFg'] = New-Brush $(if ((0.299 * $c.R + 0.587 * $c.G + 0.114 * $c.B) -gt 150) { '#101010' } else { '#FFFFFF' })
+    if ("$($script:cfg['ui:bg'])" -eq 'Glow') {
+        $gb = New-Object Windows.Media.LinearGradientBrush; $gb.StartPoint = '0,0'; $gb.EndPoint = '1,1'
+        $f = if ($t.IsDark) { 0.22 } else { 0.14 }
+        [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop (Mix $t.Bg $acc $f), 0.0))
+        [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($t.Bg)), 0.62))
+        $gb.Freeze(); $r['UiWinBg'] = $gb
+    } else { $r['UiWinBg'] = New-Brush $t.Bg }
+    $sz = switch ("$($script:cfg['ui:size'])") { 'Small' { 140, 210 } 'Large' { 212, 318 } default { 172, 258 } }
+    $r['UiPW'] = [double]$sz[0]; $r['UiPH'] = [double]$sz[1]
+    $script:animOn = "$($script:cfg['ui:anim'])" -ne 'Off'
+    $script:themeBg = $t.Bg; $script:themeDark = [bool]$t.IsDark
+    Set-TitleBar
+}
+function Anim-Slide($el, $axis, $from, $ms = 350, $delay = 0) {
+    if (-not $script:animOn) { $el.Opacity = 1; $el.RenderTransform = $null; return }
+    if ($delay -gt 0) { $el.Opacity = 0 }
+    $tt = New-Object Windows.Media.TranslateTransform; $el.RenderTransform = $tt
+    $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds($ms)); $ea = New-Object Windows.Media.Animation.CubicEase; $ea.EasingMode = 'EaseOut'
+    $a = New-Object Windows.Media.Animation.DoubleAnimation 0, 1, $dur; $a.BeginTime = [TimeSpan]::FromMilliseconds($delay)
+    $b = New-Object Windows.Media.Animation.DoubleAnimation $from, 0, $dur; $b.EasingFunction = $ea; $b.BeginTime = $a.BeginTime
+    $el.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
+    $prop = if ($axis -eq 'x') { [Windows.Media.TranslateTransform]::XProperty } else { [Windows.Media.TranslateTransform]::YProperty }
+    $tt.BeginAnimation($prop, $b)
+}
+function Fade($el, $from, $ms) {
+    if (-not $script:animOn) { return }
+    $a = New-Object Windows.Media.Animation.DoubleAnimation $from, 1, (New-Object Windows.Duration ([TimeSpan]::FromMilliseconds($ms)))
+    $el.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
+}
 $app = New-Object Windows.Application
 $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
  <Style x:Key="Btn" TargetType="Button">
-  <Setter Property="Foreground" Value="#F3F3F3"/><Setter Property="Background" Value="#38383C"/><Setter Property="Padding" Value="14,10"/>
+  <Setter Property="Foreground" Value="{DynamicResource UiText}"/><Setter Property="Background" Value="{DynamicResource UiBtn}"/><Setter Property="Padding" Value="14,10"/>
   <Setter Property="Cursor" Value="Hand"/><Setter Property="FontSize" Value="13.5"/><Setter Property="Margin" Value="0,0,0,8"/>
   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
-   <Border x:Name="b" Background="{TemplateBinding Background}" CornerRadius="7" Padding="{TemplateBinding Padding}"><ContentPresenter HorizontalAlignment="Center"/></Border>
+   <Border x:Name="b" Background="{TemplateBinding Background}" CornerRadius="7" Padding="{TemplateBinding Padding}" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform><ContentPresenter HorizontalAlignment="Center"/></Border>
    <ControlTemplate.Triggers>
     <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Opacity" Value="0.82"/></Trigger>
+    <Trigger Property="IsPressed" Value="True">
+     <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="0.95" Duration="0:0:0.08"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="0.95" Duration="0:0:0.08"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
+     <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.16"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.16"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
+    </Trigger>
     <Trigger Property="IsEnabled" Value="False"><Setter TargetName="b" Property="Opacity" Value="0.35"/></Trigger>
    </ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
  </Style>
  <Style x:Key="Chip" TargetType="RadioButton">
   <Setter Property="Margin" Value="0,0,6,0"/><Setter Property="Cursor" Value="Hand"/>
   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="RadioButton">
-   <Border x:Name="b" Background="#2B2B2E" CornerRadius="15" Padding="14,6"><TextBlock x:Name="t" Text="{TemplateBinding Content}" FontSize="12.5" Foreground="#DDDDDD"/></Border>
-   <ControlTemplate.Triggers><Trigger Property="IsChecked" Value="True"><Setter TargetName="b" Property="Background" Value="#60CDFF"/><Setter TargetName="t" Property="Foreground" Value="#101010"/></Trigger></ControlTemplate.Triggers>
+   <Border x:Name="b" Background="{DynamicResource UiCard}" CornerRadius="15" Padding="14,6"><TextBlock x:Name="t" Text="{TemplateBinding Content}" FontSize="12.5" Foreground="{DynamicResource UiChipText}"/></Border>
+   <ControlTemplate.Triggers><Trigger Property="IsChecked" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource UiAccent}"/><Setter TargetName="t" Property="Foreground" Value="{DynamicResource UiAccentFg}"/></Trigger></ControlTemplate.Triggers>
   </ControlTemplate></Setter.Value></Setter>
  </Style>
  <Style TargetType="ListBoxItem">
   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem">
    <Border x:Name="b" CornerRadius="12" Padding="3" Margin="5" BorderThickness="2" BorderBrush="Transparent" Background="Transparent" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform><ContentPresenter/></Border>
    <ControlTemplate.Triggers>
-    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="#2E2E32"/>
+    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource UiHover}"/>
     <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.045" Duration="0:0:0.14"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.045" Duration="0:0:0.14"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
     <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.18"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.18"/></Storyboard></BeginStoryboard></Trigger.ExitActions></Trigger>
-    <Trigger Property="IsSelected" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="#60CDFF"/></Trigger>
+    <Trigger Property="IsSelected" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="{DynamicResource UiAccent}"/></Trigger>
    </ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
  </Style>
  <Style TargetType="ScrollBar"><Setter Property="Width" Value="10"/><Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ScrollBar">
-  <Grid Background="Transparent"><Track x:Name="PART_Track" IsDirectionReversed="True"><Track.Thumb><Thumb><Thumb.Template><ControlTemplate TargetType="Thumb"><Border Background="#5A5A5F" CornerRadius="4" Margin="2"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb></Track></Grid>
+  <Grid Background="Transparent"><Track x:Name="PART_Track" IsDirectionReversed="True"><Track.Thumb><Thumb><Thumb.Template><ControlTemplate TargetType="Thumb"><Border Background="{DynamicResource UiThumb}" CornerRadius="4" Margin="2"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb></Track></Grid>
  </ControlTemplate></Setter.Value></Setter></Style>
+ <Style x:Key="Swatch" TargetType="Button"><Setter Property="Width" Value="30"/><Setter Property="Height" Value="30"/><Setter Property="Margin" Value="0,0,8,8"/><Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
+   <Border x:Name="b" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="2" CornerRadius="15" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform></Border>
+   <ControlTemplate.Triggers><Trigger Property="IsMouseOver" Value="True">
+    <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.2" Duration="0:0:0.12"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.2" Duration="0:0:0.12"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
+    <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.15"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.15"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
+   </Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
+ </Style>
  <Style x:Key="CoverRect" TargetType="Rectangle"><Style.Triggers><DataTrigger Binding="{Binding Cover}" Value="{x:Null}"><Setter Property="Opacity" Value="0"/>
   <DataTrigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.7"/></Storyboard></BeginStoryboard></DataTrigger.ExitActions>
  </DataTrigger></Style.Triggers></Style>
 </ResourceDictionary>
 '@)
+Apply-Theme
 $w = [Windows.Markup.XamlReader]::Parse(@'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
- Title="Repack Shelf" Width="1240" Height="780" MinWidth="980" MinHeight="600" Background="#1B1B1D" Foreground="#F3F3F3"
+ Title="Repack Shelf" Width="1240" Height="780" MinWidth="980" MinHeight="600" Background="{DynamicResource UiWinBg}" Foreground="{DynamicResource UiText}"
  WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable Text, Segoe UI" UseLayoutRounding="True">
  <Window.Triggers><EventTrigger RoutedEvent="Window.Loaded"><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.45"/></Storyboard></BeginStoryboard></EventTrigger></Window.Triggers>
  <Grid>
@@ -346,18 +418,18 @@ $w = [Windows.Markup.XamlReader]::Parse(@'
   <Grid Margin="24,18,24,8">
    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="300"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
    <TextBlock Text="Repack Shelf" FontSize="25" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,24,0"/>
-   <Border Grid.Column="1" Background="#2B2B2E" CornerRadius="9" Padding="12,2">
-    <Grid><TextBox x:Name="search" Background="Transparent" Foreground="#F3F3F3" CaretBrush="#F3F3F3" BorderThickness="0" FontSize="14" Padding="0,7"/>
-     <TextBlock x:Name="ph" Text="Search games" Foreground="#777777" FontSize="14" IsHitTestVisible="False" VerticalAlignment="Center"/></Grid></Border>
+   <Border Grid.Column="1" Background="{DynamicResource UiCard}" CornerRadius="9" Padding="12,2">
+    <Grid><TextBox x:Name="search" Background="Transparent" Foreground="{DynamicResource UiText}" CaretBrush="{DynamicResource UiText}" BorderThickness="0" FontSize="14" Padding="0,7"/>
+     <TextBlock x:Name="ph" Text="Search games" Foreground="{DynamicResource UiMuted}" FontSize="14" IsHitTestVisible="False" VerticalAlignment="Center"/></Grid></Border>
    <StackPanel x:Name="chips" Grid.Column="2" Orientation="Horizontal" Margin="18,0,0,0" VerticalAlignment="Center">
     <RadioButton Content="All" Tag="All" IsChecked="True" Style="{StaticResource Chip}" GroupName="f"/>
     <RadioButton Content="FitGirl" Tag="FitGirl" Style="{StaticResource Chip}" GroupName="f"/>
     <RadioButton Content="DODI" Tag="DODI" Style="{StaticResource Chip}" GroupName="f"/>
     <RadioButton Content="OnlineFix" Tag="OnlineFix" Style="{StaticResource Chip}" GroupName="f"/>
-    <RadioButton Content="Other Inno" Tag="Other" Style="{StaticResource Chip}" GroupName="f"/>
-    <TextBlock x:Name="count" Foreground="#888888" VerticalAlignment="Center" Margin="10,0,0,0"/>
+    <TextBlock x:Name="count" Foreground="{DynamicResource UiMuted}" VerticalAlignment="Center" Margin="10,0,0,0"/>
    </StackPanel>
    <StackPanel Grid.Column="3" Orientation="Horizontal">
+    <Button x:Name="btnCustom" Content="Customise" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
     <Button x:Name="btnUpdate" Content="Updates" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
     <Button x:Name="btnFold" Content="Folders" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
     <Button x:Name="btnScan" Content="Rescan" Style="{StaticResource Btn}" Margin="0"/>
@@ -365,10 +437,10 @@ $w = [Windows.Markup.XamlReader]::Parse(@'
   </Grid>
   <Grid Grid.Row="1" Margin="14,4,0,0">
    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="350"/></Grid.ColumnDefinitions>
-   <ListBox x:Name="list" Foreground="#F3F3F3" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" Margin="0,0,6,0">
+   <ListBox x:Name="list" Foreground="{DynamicResource UiText}" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" Margin="0,0,6,0">
     <ListBox.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ListBox.ItemsPanel>
     <ListBox.ItemTemplate><DataTemplate>
-     <Grid Width="172" Height="258">
+     <Grid Width="{DynamicResource UiPW}" Height="{DynamicResource UiPH}">
       <Rectangle RadiusX="10" RadiusY="10" Fill="{Binding Accent}"/>
       <TextBlock Text="{Binding Letter}" FontSize="76" FontWeight="Bold" Foreground="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-40,0,0"/>
       <Image Source="{Binding Icon}" Width="48" Height="48" Margin="0,60,0,0" Opacity="0.9"/>
@@ -381,9 +453,9 @@ $w = [Windows.Markup.XamlReader]::Parse(@'
       </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
      </Grid></DataTemplate></ListBox.ItemTemplate>
    </ListBox>
-   <Border Grid.Column="1" Background="#242427" CornerRadius="14,0,0,0" Padding="26,26,26,16">
+   <Border Grid.Column="1" Background="{DynamicResource UiPanel}" CornerRadius="14,0,0,0" Padding="26,26,26,16">
     <Grid>
-     <TextBlock x:Name="empty" Text="Select a game" Foreground="#777777" FontSize="16" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+     <TextBlock x:Name="empty" Text="Select a game" Foreground="{DynamicResource UiMuted}" FontSize="16" HorizontalAlignment="Center" VerticalAlignment="Center"/>
      <ScrollViewer x:Name="detail" Visibility="Collapsed" VerticalScrollBarVisibility="Auto"><StackPanel>
       <Grid Width="200" Height="300" Margin="0,0,0,16">
        <Rectangle RadiusX="12" RadiusY="12" Fill="{Binding Accent}"/><TextBlock Text="{Binding Letter}" FontSize="96" FontWeight="Bold" Foreground="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-50,0,0"/><Image Source="{Binding Icon}" Width="64" Height="64" Margin="0,80,0,0"/>
@@ -393,34 +465,44 @@ $w = [Windows.Markup.XamlReader]::Parse(@'
       <ItemsControl ItemsSource="{Binding Badges}" HorizontalAlignment="Center" Margin="0,8,0,14"><ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate></ItemsControl.ItemsPanel><ItemsControl.ItemTemplate><DataTemplate>
        <Border Background="{Binding Color}" CornerRadius="10" Padding="10,3" Margin="3,0"><TextBlock Text="{Binding Text}" FontSize="11.5" FontWeight="SemiBold" Foreground="White"/></Border>
       </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
-      <TextBlock Text="{Binding Meta}" Foreground="#B4B4B8" FontSize="12.5" LineHeight="22" TextWrapping="Wrap" Margin="0,0,0,18"/>
-      <Button x:Name="btnPlay" Content="Play" Style="{StaticResource Btn}" Background="#60CDFF" Foreground="#101010" FontWeight="SemiBold" FontSize="15" Padding="14,12"/>
+      <TextBlock Text="{Binding Meta}" Foreground="{DynamicResource UiSub}" FontSize="12.5" LineHeight="22" TextWrapping="Wrap" Margin="0,0,0,18"/>
+      <Button x:Name="btnPlay" Content="Play" Style="{StaticResource Btn}" Background="{DynamicResource UiAccent}" Foreground="{DynamicResource UiAccentFg}" FontWeight="SemiBold" FontSize="15" Padding="14,12"/>
       <Button x:Name="btnFolder" Content="Open folder" Style="{StaticResource Btn}"/>
       <Button x:Name="btnExe" Content="Set .exe" Style="{StaticResource Btn}"/>
       <Button x:Name="btnFind" Content="Find cover online..." Style="{StaticResource Btn}"/>
       <Button x:Name="btnCover" Content="Set cover image" Style="{StaticResource Btn}"/>
-      <Button x:Name="btnMark" Content="Mark as repack" Style="{StaticResource Btn}" Visibility="Collapsed"/>
       <Button x:Name="btnUn" Content="Uninstall completely" Style="{StaticResource Btn}" Background="#C42B1C"/>
      </StackPanel></ScrollViewer>
     </Grid>
    </Border>
   </Grid>
-  <Border x:Name="updBar" Grid.RowSpan="3" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,48" Background="#2F2F34" BorderBrush="#60CDFF" BorderThickness="1" CornerRadius="12" Padding="18,12" Visibility="Collapsed">
+  <Border x:Name="updBar" Grid.RowSpan="3" VerticalAlignment="Bottom" HorizontalAlignment="Center" Margin="0,0,0,48" Background="{DynamicResource UiPanel2}" BorderBrush="{DynamicResource UiAccent}" BorderThickness="1" CornerRadius="12" Padding="18,12" Visibility="Collapsed">
    <StackPanel Orientation="Horizontal">
-    <StackPanel Margin="0,0,20,0" VerticalAlignment="Center"><TextBlock x:Name="updTitle" FontWeight="SemiBold" FontSize="14"/><TextBlock x:Name="updSub" Foreground="#A8A8AD" FontSize="12"/></StackPanel>
-    <Button x:Name="btnUpd" Content="Update now" Style="{StaticResource Btn}" Background="#60CDFF" Foreground="#101010" Margin="0,0,8,0" Padding="16,8"/>
+    <StackPanel Margin="0,0,20,0" VerticalAlignment="Center"><TextBlock x:Name="updTitle" FontWeight="SemiBold" FontSize="14"/><TextBlock x:Name="updSub" Foreground="{DynamicResource UiSub}" FontSize="12"/></StackPanel>
+    <Button x:Name="btnUpd" Content="Update now" Style="{StaticResource Btn}" Background="{DynamicResource UiAccent}" Foreground="{DynamicResource UiAccentFg}" Margin="0,0,8,0" Padding="16,8"/>
     <Button x:Name="btnLater" Content="Later" Style="{StaticResource Btn}" Margin="0" Padding="14,8"/>
    </StackPanel></Border>
-  <ProgressBar x:Name="busy" Grid.Row="2" Height="3" VerticalAlignment="Top" IsIndeterminate="True" Background="Transparent" BorderThickness="0" Foreground="#60CDFF" Visibility="Collapsed"/>
-  <TextBlock x:Name="status" Grid.Row="2" Foreground="#808085" FontSize="12" Margin="26,6,0,10"/>
+  <Border x:Name="settings" Grid.RowSpan="3" HorizontalAlignment="Right" Width="360" Visibility="Collapsed" Background="{DynamicResource UiPanel2}" BorderBrush="{DynamicResource UiCard}" BorderThickness="1,0,0,0" Padding="24,20,24,16">
+   <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+    <Grid><TextBlock Text="Customise" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="btnCloseSet" Content="Close" Style="{StaticResource Btn}" HorizontalAlignment="Right" Padding="14,6" Margin="0"/></Grid>
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,18,0,0"><StackPanel>
+     <TextBlock Text="THEME" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optTheme" Margin="0,8,0,20"><RadioButton Content="Dark" Tag="Dark" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Midnight" Tag="Midnight" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Slate" Tag="Slate" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Light" Tag="Light" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ACCENT COLOUR" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/>
+     <WrapPanel x:Name="swatches" Margin="0,8,0,4"/>
+     <StackPanel Orientation="Horizontal" Margin="0,0,0,20"><Border Background="{DynamicResource UiCard}" CornerRadius="8" Padding="10,2" Margin="0,0,8,0"><TextBox x:Name="hexBox" Width="96" Background="Transparent" Foreground="{DynamicResource UiText}" CaretBrush="{DynamicResource UiText}" BorderThickness="0" Padding="0,6" FontSize="13"/></Border><Button x:Name="btnHex" Content="Apply" Style="{StaticResource Btn}" Padding="14,7" Margin="0"/></StackPanel>
+     <TextBlock Text="POSTER SIZE" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optSize" Margin="0,8,0,20"><RadioButton Content="Small" Tag="Small" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Medium" Tag="Medium" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Large" Tag="Large" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="BACKGROUND" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optBg" Margin="0,8,0,20"><RadioButton Content="Solid" Tag="Solid" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Glow" Tag="Glow" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ENTRANCE ANIMATIONS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optAnim" Margin="0,8,0,20"><RadioButton Content="On" Tag="On" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Off" Tag="Off" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel>
+     <Button x:Name="btnReset" Content="Reset to default" Style="{StaticResource Btn}" Margin="0,4,0,0"/>
+    </StackPanel></ScrollViewer></Grid></Border>
+  <ProgressBar x:Name="busy" Grid.Row="2" Height="3" VerticalAlignment="Top" IsIndeterminate="True" Background="Transparent" BorderThickness="0" Foreground="{DynamicResource UiAccent}" Visibility="Collapsed"/>
+  <TextBlock x:Name="status" Grid.Row="2" Foreground="{DynamicResource UiMuted}" FontSize="12" Margin="26,6,0,10"/>
  </Grid>
 </Window>
 '@)
-foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','busy','btnUpdate','updBar','updTitle','updSub','btnUpd','btnLater','btnMark','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
+foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','busy','btnUpdate','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
 $w.Title = if ($AppVersion.StartsWith('__')) { 'Repack Shelf (dev build)' } else { "Repack Shelf v$AppVersion" }
 $script:filter = 'All'; $script:games = @(); $script:byKey = @{}
 
 function Animate-In {
+    if (-not $script:animOn) { return }
     $n = 0; $ease = New-Object Windows.Media.Animation.CubicEase; $ease.EasingMode = 'EaseOut'
     foreach ($it in $list.Items) {
         $c = $list.ItemContainerGenerator.ContainerFromItem($it); if (-not $c) { continue }
@@ -438,7 +520,7 @@ function Refresh-List {
     $q = $search.Text.Trim(); $f = $script:filter
     $v = @($script:games | Where-Object {
         $t = $_.Tags
-        (($f -eq 'All' -and $t -ne 'Inno') -or ($f -eq 'Other' -and $t -eq 'Inno') -or ($f -notin 'All', 'Other' -and (($t -split ',') -contains $f))) -and (-not $q -or $_.Name -like "*$q*")
+        (($f -eq 'All') -or (($t -split ',') -contains $f)) -and (-not $q -or $_.Name -like "*$q*")
     })
     $list.ItemsSource = $v; $count.Text = "$($v.Count) game(s)"; $list.UpdateLayout(); Animate-In
     if ($v.Count -eq 0) { $empty.Text = if ($script:games.Count -eq 0) { "No repack or OnlineFix games found yet.`nUse Folders to add the folder your games live in." } else { 'Nothing matches this filter' } }
@@ -494,11 +576,7 @@ function Show-Update($m) {
         $script:upd = $m
         $updTitle.Text = "Update available: v$newV"; $updSub.Text = "You are on v$curV"
         $btnUpd.IsEnabled = $true; $btnLater.IsEnabled = $true; $updBar.Visibility = 'Visible'
-        $tt = New-Object Windows.Media.TranslateTransform 0, 40; $updBar.RenderTransform = $tt
-        $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(450)); $ea = New-Object Windows.Media.Animation.CubicEase; $ea.EasingMode = 'EaseOut'
-        $a = New-Object Windows.Media.Animation.DoubleAnimation 0, 1, $dur
-        $b = New-Object Windows.Media.Animation.DoubleAnimation 40, 0, $dur; $b.EasingFunction = $ea
-        $updBar.BeginAnimation([Windows.UIElement]::OpacityProperty, $a); $tt.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $b)
+        Anim-Slide $updBar 'y' 40 450
     } elseif ($m.Manual) { $status.Text = "You are on the latest version (v$AppVersion)." }
 }
 function Install-Update {
@@ -531,6 +609,51 @@ function Install-Update {
     $w.Close()
 }
 $script:upd = $null
+function Sync-Opts {
+    $script:syncing = $true
+    $def = @{ theme = 'Dark'; size = 'Medium'; bg = 'Solid'; anim = 'On' }
+    foreach ($pair in @(@($optTheme, 'theme'), @($optSize, 'size'), @($optBg, 'bg'), @($optAnim, 'anim'))) {
+        $v = "$($script:cfg['ui:' + $pair[1]])"; if (-not $v) { $v = $def[$pair[1]] }
+        foreach ($rb in $pair[0].Children) { $rb.IsChecked = ($rb.Tag -eq $v) }
+    }
+    $acc = "$($script:cfg['ui:accent'])"; if (-not $acc) { $acc = '#60CDFF' }
+    $hexBox.Text = $acc
+    foreach ($b in $swatches.Children) { $b.BorderBrush = if ($b.Tag -eq $acc) { $app.Resources['UiText'] } else { [Windows.Media.Brushes]::Transparent } }
+    $script:syncing = $false
+}
+function Opt-Changed($rb) {
+    if ($script:syncing) { return }
+    $k = switch ($rb.Parent.Name) { 'optTheme' { 'theme' } 'optSize' { 'size' } 'optBg' { 'bg' } default { 'anim' } }
+    $script:cfg["ui:$k"] = $rb.Tag; Save-Cfg; Apply-Theme; Fade $w.Content 0.9 240
+    if ($k -eq 'size') { $list.UpdateLayout(); Animate-In }
+}
+function Show-Settings { Sync-Opts; $settings.Visibility = 'Visible'; Anim-Slide $settings 'x' 380 380 }
+function Hide-Settings {
+    if (-not $script:animOn) { $settings.Visibility = 'Collapsed'; return }
+    $tt = New-Object Windows.Media.TranslateTransform; $settings.RenderTransform = $tt
+    $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(260)); $ea = New-Object Windows.Media.Animation.CubicEase; $ea.EasingMode = 'EaseIn'
+    $b = New-Object Windows.Media.Animation.DoubleAnimation 0, 380, $dur; $b.EasingFunction = $ea
+    $b.Add_Completed({ $settings.Visibility = 'Collapsed' })
+    $tt.BeginAnimation([Windows.Media.TranslateTransform]::XProperty, $b)
+}
+foreach ($hex in $Accents) {
+    $b = New-Object Windows.Controls.Button; $b.Style = $app.Resources['Swatch']; $b.Background = New-Brush $hex; $b.Tag = $hex; $b.ToolTip = $hex
+    $b.Add_Click({ $script:cfg['ui:accent'] = $args[0].Tag; Save-Cfg; Apply-Theme; Sync-Opts })
+    [void]$swatches.Children.Add($b)
+}
+foreach ($p in $optTheme, $optSize, $optBg, $optAnim) { foreach ($rb in $p.Children) { $rb.Add_Checked({ Opt-Changed $args[0] }) } }
+$btnCustom.Add_Click({ if ($settings.Visibility -eq 'Visible') { Hide-Settings } else { Show-Settings } })
+$btnCloseSet.Add_Click({ Hide-Settings })
+$btnHex.Add_Click({
+    $h = $hexBox.Text.Trim(); if ($h -notmatch '^#') { $h = "#$h" }
+    if ($h -notmatch '^#[0-9A-Fa-f]{6}$') { Tell 'Enter a colour like #60CDFF (six hex digits).'; return }
+    $script:cfg['ui:accent'] = $h.ToUpper(); Save-Cfg; Apply-Theme; Sync-Opts
+})
+$btnReset.Add_Click({
+    foreach ($k in 'ui:theme', 'ui:accent', 'ui:size', 'ui:bg', 'ui:anim') { $script:cfg.Remove($k) }
+    Save-Cfg; Apply-Theme; Sync-Opts; Fade $w.Content 0.9 240
+})
+
 $pump = New-Object Windows.Threading.DispatcherTimer; $pump.Interval = [TimeSpan]::FromMilliseconds(400)
 $pump.Add_Tick({
     $m = $null
@@ -553,13 +676,8 @@ $list.Add_SelectionChanged({
     if (-not $g) { return }
     $detail.DataContext = $g; $empty.Visibility = 'Collapsed'; $detail.Visibility = 'Visible'
     $btnPlay.IsEnabled = [bool]$g.Exe
-    $btnMark.Visibility = if (($g.Tags -match 'Inno') -and ($g.Tags -notmatch 'FitGirl|DODI|Repack')) { 'Visible' } else { 'Collapsed' }
     $btnUn.Content = if ($g.UnExe -or $g.KeyPath) { 'Uninstall completely' } else { 'Delete game folder' }
-    $tt = New-Object Windows.Media.TranslateTransform 28, 0; $detail.RenderTransform = $tt
-    $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(320)); $ea = New-Object Windows.Media.Animation.CubicEase; $ea.EasingMode = 'EaseOut'
-    $a = New-Object Windows.Media.Animation.DoubleAnimation 0, 1, $dur
-    $b = New-Object Windows.Media.Animation.DoubleAnimation 28, 0, $dur; $b.EasingFunction = $ea
-    $detail.BeginAnimation([Windows.UIElement]::OpacityProperty, $a); $tt.BeginAnimation([Windows.Media.TranslateTransform]::XProperty, $b)
+    Anim-Slide $detail 'x' 28 330
 })
 $list.Add_MouseDoubleClick({ Play })
 $search.Add_TextChanged({ $ph.Visibility = if ($search.Text) { 'Collapsed' } else { 'Visible' }; Refresh-List })
@@ -591,7 +709,6 @@ $btnFind.Add_Click({
     $g.Cover = $null; $script:miss = 0; $script:doneMsg = $false
     Start-Bg $coverSb @($job); $status.Text = 'Searching for cover...'
 })
-$btnMark.Add_Click({ $script:cfg["tag:$($list.SelectedItem.Key)"] = 'Repack'; Save-Cfg; Scan-And-Show })
 $btnFold.Add_Click({
     $cur = @($script:cfg['folders'])
     $r = [Windows.MessageBox]::Show("Extra folders scanned for games (besides any 'Games' folder at a drive root):`n`n$(if ($cur) { $cur -join "`n" } else { '(none)' })`n`nYes = add a folder    No = clear this list    Cancel = close", 'Library folders', 'YesNoCancel', 'Question')
@@ -606,22 +723,21 @@ $btnUn.Add_Click({
         if (-not (Ask "Uninstall $($i.Name)?`n`nIts own uninstaller runs first, then leftover files in`n$($i.Dir)`ncan be removed. Save games outside that folder are not touched.")) { return }
         Start-Process -FilePath $i.UnExe -WorkingDirectory (Split-Path $i.UnExe)
         $status.Text = 'Waiting for the uninstaller to finish...'
-        $t = New-Object Windows.Threading.DispatcherTimer; $t.Interval = [TimeSpan]::FromSeconds(2); $t0 = Get-Date
+        $script:unI = $i; $script:unT0 = Get-Date
+        $t = New-Object Windows.Threading.DispatcherTimer; $t.Interval = [TimeSpan]::FromSeconds(2)
         $t.Add_Tick({
+            $i = $script:unI
             $done = if ($i.KeyPath) { -not (Test-Path -LiteralPath $i.KeyPath) } else { -not (Test-Path -LiteralPath $i.UnExe) }
-            if ($done) { $t.Stop(); Finish-Remove $i $false }
-            elseif (((Get-Date) - $t0).TotalMinutes -gt 30) { $t.Stop(); $status.Text = 'Uninstall did not complete.' }
-        }.GetNewClosure())
+            if ($done) { $args[0].Stop(); Finish-Remove $i $false }
+            elseif (((Get-Date) - $script:unT0).TotalMinutes -gt 30) { $args[0].Stop(); $status.Text = 'Uninstall did not complete.' }
+        })
         $t.Start()
     } elseif (Ask "$($i.Name) has no uninstaller.`n`nPermanently delete its folder ($(Fmt (Get-DirSize $i.Dir)))?`n$($i.Dir)") { Finish-Remove $i $true }
 })
 
-$w.Add_SourceInitialized({
-    $h = (New-Object Windows.Interop.WindowInteropHelper $w).Handle
-    $v = 1; [void][Dwm]::DwmSetWindowAttribute($h, 20, [ref]$v, 4)
-    $c = 0x1D1B1B; [void][Dwm]::DwmSetWindowAttribute($h, 35, [ref]$c, 4)
-})
+$w.Add_SourceInitialized({ Set-TitleBar })
 $w.Add_ContentRendered({ if (-not $script:started) { $script:started = $true
+    $n = 0; foreach ($c in $w.Content.Children[0].Children) { Anim-Slide $c 'y' -14 420 ($n * 70); $n++ }
     Load-Library
     if ($script:games.Count) { Refresh-List; $status.Text = "Loaded $($script:games.Count) game(s). Checking for changes..."; $w.Dispatcher.Invoke([action]{}, 'Render') }
     Scan-And-Show; Check-Update $false } })
