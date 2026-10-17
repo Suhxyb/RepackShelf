@@ -12,7 +12,7 @@ public class RsGame : INotifyPropertyChanged {
   void N(string p) { var h = PropertyChanged; if (h != null) h(this, new PropertyChangedEventArgs(p)); }
   public string Key {get;set;} public string KeyPath {get;set;} public string Name {get;set;} public string Dir {get;set;}
   public string UnExe {get;set;} public string Exe {get;set;} public string Version {get;set;} public string Date {get;set;} public string Tags {get;set;}
-  public object Badges {get;set;} public object Icon {get;set;} public string Accent {get;set;} public string Letter {get;set;}
+  public object Badges {get;set;} public object Icon {get;set;} public string Accent {get;set;} public string Letter {get;set;} public string IconSrc {get;set;}
   object cover; public object Cover { get { return cover; } set { cover = value; N("Cover"); } }
   string size; public string Size { get { return size; } set { size = value; N("Meta"); } }
   public string Meta { get { return "Folder   " + Dir + "\nSize   " + (Size ?? "calculating...") + "\nVersion   " + (Version ?? "n/a") + "\nInstalled   " + (Date ?? "n/a") + "\nLaunches   " + (Exe ?? "no executable found - use Set .exe"); } }
@@ -26,6 +26,8 @@ $cfgPath = Join-Path $appDir 'config.json'
 $script:cfg = @{}
 if (Test-Path $cfgPath) { try { (Get-Content $cfgPath -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $script:cfg[$_.Name] = $_.Value } } catch {} }
 function Save-Cfg { $script:cfg | ConvertTo-Json | Set-Content $cfgPath }
+$libPath = Join-Path $appDir 'library.json'
+$script:ofCache = @{}; $script:datCache = @{}; $script:exeCache = @{}; $script:fullScan = $false; $script:scanning = $false
 
 # ---------- helpers ----------
 function Fmt($b) { if ($b -ge 1GB) { '{0:N1} GB' -f ($b / 1GB) } else { '{0:N0} MB' -f ($b / 1MB) } }
@@ -33,7 +35,64 @@ function Get-DirSize($d) { $s = 0L; try { foreach ($f in [IO.Directory]::Enumera
 function Ask($t) { [Windows.MessageBox]::Show($t, 'Repack Shelf', 'YesNo', 'Warning') -eq 'Yes' }
 function Tell($t) { [void][Windows.MessageBox]::Show($t, 'Repack Shelf', 'OK', 'Information') }
 function Cache-Path($key) { Join-Path $coverDir (([BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($key))) -replace '-') + '.jpg') }
-function Find-OF($dir) { try { foreach ($f in [IO.Directory]::EnumerateFiles($dir, 'OnlineFix*', [IO.SearchOption]::AllDirectories)) { return $true } } catch {}; $false }
+function Find-OF($dir, $depth = 3) {
+    try {
+        if ([IO.Directory]::EnumerateFiles($dir, 'OnlineFix*').GetEnumerator().MoveNext()) { return $true }
+        if ($depth -gt 0) { foreach ($d in [IO.Directory]::EnumerateDirectories($dir)) { if (Find-OF $d ($depth - 1)) { return $true } } }
+    } catch {}
+    $false
+}
+function Find-OFCached($dir) {
+    $t = try { "$((Get-Item -LiteralPath $dir -ErrorAction Stop).LastWriteTimeUtc.Ticks)" } catch { '0' }
+    $e = $script:ofCache[$dir]
+    if (-not $script:fullScan -and $e -and $e.T -eq $t) { return [bool]$e.V }
+    $v = Find-OF $dir
+    $script:ofCache[$dir] = @{ T = $t; V = $v }
+    $v
+}
+function Get-InnoTag($dat) {
+    try {
+        if (-not (Test-Path -LiteralPath $dat)) { return 'Inno' }
+        $fi = Get-Item -LiteralPath $dat
+        if ($fi.Length -ge 8MB) { return 'Inno' }
+        $L = "$($fi.Length)"; $e = $script:datCache[$dat]
+        if (-not $script:fullScan -and $e -and $e.L -eq $L) { return $e.V }
+        $txt = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($dat)) -replace "`0", ''
+        $v = if ($txt -match '(?i)fit-?girl') { 'FitGirl' } elseif ($txt -match '(?i)dodi[- ]?repack|\bdodi\b') { 'DODI' } else { 'Inno' }
+        $script:datCache[$dat] = @{ L = $L; V = $v }
+        $v
+    } catch { 'Inno' }
+}
+function Step($i, $total, $text) {
+    $busy.IsIndeterminate = $false; $busy.Maximum = [Math]::Max($total, 1); $busy.Value = $i; $busy.Visibility = 'Visible'
+    $status.Text = $text
+    $w.Dispatcher.Invoke([action]{}, 'Render')
+}
+function Save-Library {
+    try {
+        $recs = @($script:games | ForEach-Object { [pscustomobject]@{ Key = $_.Key; KeyPath = $_.KeyPath; Name = $_.Name; Dir = $_.Dir; UnExe = $_.UnExe; Tags = $_.Tags; Exe = $_.Exe; IconSrc = $_.IconSrc; Version = $_.Version; Date = $_.Date; Size = $_.Size } })
+        [pscustomobject]@{ v = 1; games = $recs; of = $script:ofCache; dat = $script:datCache } | ConvertTo-Json -Depth 4 | Set-Content $libPath -Encoding UTF8
+    } catch {}
+}
+function Load-Library {
+    if (-not (Test-Path $libPath)) { return }
+    try {
+        $d = Get-Content $libPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($d.of) { foreach ($p in $d.of.PSObject.Properties) { $script:ofCache[$p.Name] = @{ T = "$($p.Value.T)"; V = [bool]$p.Value.V } } }
+        if ($d.dat) { foreach ($p in $d.dat.PSObject.Properties) { $script:datCache[$p.Name] = @{ L = "$($p.Value.L)"; V = "$($p.Value.V)" } } }
+        $games = @()
+        foreach ($r in @($d.games)) {
+            if (-not $r.Dir -or -not (Test-Path -LiteralPath $r.Dir)) { continue }
+            $script:exeCache[$r.Key] = $r.Exe
+            $rec = [pscustomobject]@{ Key = $r.Key; KeyPath = $r.KeyPath; Name = $r.Name; Dir = $r.Dir; UnExe = $r.UnExe; Tags = @("$($r.Tags)" -split ','); IconSrc = $r.IconSrc; Version = $r.Version; Date = $r.Date }
+            $g = New-Game $rec
+            if ($r.Size) { $g.Size = $r.Size }
+            $games += $g
+        }
+        $script:games = $games; $script:byKey = @{}
+        foreach ($g in $games) { $script:byKey[$g.Key] = $g }
+    } catch {}
+}
 function Get-Term($n) {
     $n = $n -replace '\[[^\]]*\]|\([^\)]*\)', ' ' -replace '[\u2122\u00AE\u00A9]', ' ' -replace '(?i)[-_. ]?online-?fix', ' ' -replace '(?i)\b(v|ver|version|build)[\s\.]?\d[\w\.]*.*$', ' ' -replace '(?i)\b(repack|fitgirl|dodi|goty|deluxe|ultimate|complete|definitive)\s*(edition)?\b', ' ' -replace '[_\.]', ' ' -replace '\s+', ' '
     $n.Trim(' ', '-')
@@ -59,82 +118,108 @@ function Load-Img($path) {
 # ---------- detection ----------
 $TagColor = @{ FitGirl = '#C2185B'; DODI = '#1976D2'; Repack = '#6A1B9A'; OnlineFix = '#2E7D32'; Inno = '#555555' }
 $TagText = @{ FitGirl = 'FitGirl'; DODI = 'DODI'; Repack = 'Repack'; OnlineFix = 'OnlineFix'; Inno = 'Inno Setup' }
-function New-Game($key, $keyPath, $name, $dir, $unExe, $tags, $icoSrc, $ver, $date) {
+function New-Game($r) {
+    $tags = @($r.Tags)
     $g = New-Object RsGame
-    $g.Key = $key; $g.KeyPath = $keyPath; $g.Name = $name; $g.Dir = $dir; $g.UnExe = $unExe; $g.Version = $ver; $g.Date = $date; $g.Tags = ($tags -join ',')
-    $exe = $script:cfg["exe:$key"]
-    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { $exe = Get-Exe $dir }
-    $g.Exe = $exe
-    if (-not $icoSrc -or -not (Test-Path -LiteralPath $icoSrc) -or $icoSrc -match 'unins') { $icoSrc = $exe }
-    if ($icoSrc) { $g.Icon = Get-Icon $icoSrc }
+    $g.Key = $r.Key; $g.KeyPath = $r.KeyPath; $g.Name = $r.Name; $g.Dir = $r.Dir; $g.UnExe = $r.UnExe; $g.Version = $r.Version; $g.Date = $r.Date; $g.Tags = ($tags -join ',')
+    $exe = $script:cfg["exe:$($r.Key)"]
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { $exe = $script:exeCache[$r.Key] }
+    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { $exe = Get-Exe $r.Dir }
+    $script:exeCache[$r.Key] = $exe; $g.Exe = $exe
+    $ico = $r.IconSrc
+    if (-not $ico -or $ico -match '[<>|"*?]' -or -not (Test-Path -LiteralPath $ico) -or $ico -match 'unins') { $ico = $exe }
+    $g.IconSrc = $ico
+    if ($ico) { $g.Icon = Get-Icon $ico }
     $g.Badges = @($tags | ForEach-Object { New-Object RsBadge -Property @{ Text = $TagText[$_]; Color = $TagColor[$_] } })
-    $c = Cache-Path $key
+    $c = Cache-Path $r.Key
     if (Test-Path $c) { $g.Cover = Load-Img $c }
     $pal = '#5B2A86', '#1F4E79', '#7A1F3D', '#1E6B52', '#8A4B08', '#2D3E8F', '#6B2D5C', '#2F5D62'
-    $h = 0; foreach ($ch in $name.ToCharArray()) { $h = ($h * 31 + [int]$ch) % 1000003 }
-    $g.Accent = $pal[$h % $pal.Count]; $g.Letter = if ($name) { $name.Substring(0, 1).ToUpper() } else { '?' }
+    $h = 0; foreach ($ch in "$($r.Name)".ToCharArray()) { $h = ($h * 31 + [int]$ch) % 1000003 }
+    $g.Accent = $pal[$h % $pal.Count]; $g.Letter = if ($r.Name) { "$($r.Name)".Substring(0, 1).ToUpper() } else { '?' }
     $g
 }
 function Scan {
     $out = @(); $seen = @{}
-    $roots = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
     $fg = '(?i)fit-?girl'; $dd = '(?i)dodi[- ]?repack|\bdodi\b'
-    foreach ($r in $roots) {
-        if (-not (Test-Path $r)) { continue }
-        foreach ($k in Get-ChildItem $r -ErrorAction SilentlyContinue) {
-            try {
-            $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
-            if (-not $p.DisplayName -or -not $p.UninstallString -or $p.SystemComponent -eq 1) { continue }
-            $name = $k.PSChildName; $un = "$($p.UninstallString)".Trim()
-            $unExe = if ($un -match '(?i)([a-z]:\\[^"<>|*?]*?\.exe)') { $Matches[1] } else { $null }
-            $dir = "$($p.InstallLocation)".Trim('"', ' ', '\')
-            if (-not $dir -and $unExe) { $dir = Split-Path $unExe -Parent }
-            if ($dir) { $dir = $dir.Trim() }
-            if (-not $dir -or $dir -match '[<>|"*?]' -or -not (Test-Path -LiteralPath $dir) -or $seen[$dir.ToLower()]) { continue }
-            $inno = ($name -like '*_is1') -or ($unExe -and $unExe -match 'unins\d{3}\.exe$')
-            $blob = "$($p.DisplayName) $($p.Publisher) $($p.URLInfoAbout) $($p.URLUpdateInfo) $($p.HelpLink) $($p.Comments) $($p.InstallLocation)"
-            $tags = @()
-            if ($blob -match $fg) { $tags = @('FitGirl') } elseif ($blob -match $dd) { $tags = @('DODI') }
-            elseif ($inno) {
-                $tags = @('Inno')
-                $dat = if ($unExe) { Join-Path (Split-Path $unExe -Parent) ([IO.Path]::GetFileNameWithoutExtension($unExe) + '.dat') } else { $null }
-                try {
-                    if ($dat -and (Test-Path -LiteralPath $dat) -and (Get-Item -LiteralPath $dat).Length -lt 8MB) {
-                        $txt = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($dat)) -replace "`0", ''
-                        if ($txt -match $fg) { $tags = @('FitGirl') } elseif ($txt -match $dd) { $tags = @('DODI') }
-                    }
-                } catch {}
-                if ($tags[0] -eq 'Inno' -and $script:cfg["tag:$name"]) { $tags = @('Repack') }
-            }
-            $of = Find-OF $dir
-            if ($of) { $tags += 'OnlineFix' }
-            if (-not $tags) { continue }
-            $date = $null
-            if ("$($p.InstallDate)" -match '^\d{8}$') { $date = [datetime]::ParseExact($p.InstallDate, 'yyyyMMdd', $null).ToString('d MMM yyyy') }
-            $seen[$dir.ToLower()] = 1
-            $out += New-Game $name $k.PSPath $p.DisplayName $dir $unExe $tags ("$($p.DisplayIcon)" -split ',')[0].Trim('"') $p.DisplayVersion $date
-            } catch { continue }
-        }
+    $srcs = @(
+        @([Microsoft.Win32.Registry]::LocalMachine, 'HKEY_LOCAL_MACHINE', 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
+        @([Microsoft.Win32.Registry]::LocalMachine, 'HKEY_LOCAL_MACHINE', 'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'),
+        @([Microsoft.Win32.Registry]::CurrentUser, 'HKEY_CURRENT_USER', 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'))
+    $entries = @()
+    foreach ($s in $srcs) {
+        try { $rk = $s[0].OpenSubKey($s[2]); if ($rk) { foreach ($n in $rk.GetSubKeyNames()) { $entries += [pscustomobject]@{ Hive = $s[0]; HiveName = $s[1]; Sub = $s[2]; Name = $n } }; $rk.Close() } } catch {}
     }
-    # folder-based games (OnlineFix releases are usually extracted, not installed)
     $folders = @($script:cfg['folders'])
     foreach ($d in [IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' }) { foreach ($n in 'Games', 'Game', 'OnlineFix', 'Downloads') { $folders += ($d.Name + $n) } }
     $folders += (Join-Path $env:USERPROFILE 'Games'), (Join-Path $env:USERPROFILE 'Downloads')
-    foreach ($root in $folders | Where-Object { $_ -and ($_ -notmatch '[<>|"*?]') -and (Test-Path -LiteralPath $_) } | Select-Object -Unique) {
-        $hits = @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction SilentlyContinue | Where-Object { Find-OF $_.FullName } | ForEach-Object { $_.FullName })
-        if (-not $hits -and (Find-OF $root)) { $hits = @($root) }
+    $roots = @($folders | Where-Object { $_ -and ($_ -notmatch '[<>|"*?]') -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)
+    $kids = @{}; $nk = 0
+    foreach ($r in $roots) { $kids[$r] = @(try { [IO.Directory]::EnumerateDirectories($r) } catch { @() }); $nk += $kids[$r].Count }
+    $total = $entries.Count + $nk; $i = 0
+
+    foreach ($e in $entries) {
+        $i++; if ($i % 15 -eq 0) { Step $i $total "Scanning installed programs ($i of $total)..." }
+        try {
+            $rk = $e.Hive.OpenSubKey("$($e.Sub)\$($e.Name)"); if (-not $rk) { continue }
+            $p = @{}
+            foreach ($n in 'DisplayName', 'UninstallString', 'InstallLocation', 'Publisher', 'URLInfoAbout', 'URLUpdateInfo', 'HelpLink', 'Comments', 'DisplayIcon', 'DisplayVersion', 'InstallDate', 'SystemComponent') { $p[$n] = "$($rk.GetValue($n))" }
+            $rk.Close()
+            if (-not $p.DisplayName -or -not $p.UninstallString -or $p.SystemComponent -eq '1') { continue }
+            $name = $e.Name; $un = $p.UninstallString.Trim()
+            $unExe = if ($un -match '(?i)([a-z]:\\[^"<>|*?]*?\.exe)') { $Matches[1] } else { $null }
+            $blob = "$($p.DisplayName) $($p.Publisher) $($p.URLInfoAbout) $($p.URLUpdateInfo) $($p.HelpLink) $($p.Comments) $($p.InstallLocation)"
+            $inno = ($name -like '*_is1') -or ($unExe -and $unExe -match 'unins\d{3}\.exe$')
+            $tags = @()
+            if ($blob -match $fg) { $tags = @('FitGirl') } elseif ($blob -match $dd) { $tags = @('DODI') }
+            elseif ($inno) {
+                $dat = if ($unExe) { Join-Path (Split-Path $unExe -Parent) ([IO.Path]::GetFileNameWithoutExtension($unExe) + '.dat') } else { $null }
+                $t = if ($dat) { Get-InnoTag $dat } else { 'Inno' }
+                $tags = @($t)
+                if ($t -eq 'Inno' -and $script:cfg["tag:$name"]) { $tags = @('Repack') }
+            }
+            if (-not $tags) { continue }
+            $dir = $p.InstallLocation.Trim('"', ' ', '\')
+            if (-not $dir -and $unExe) { $dir = Split-Path $unExe -Parent }
+            if ($dir) { $dir = $dir.Trim() }
+            if (-not $dir -or $dir -match '[<>|"*?]' -or -not (Test-Path -LiteralPath $dir) -or $seen[$dir.ToLower()]) { continue }
+            if (Find-OFCached $dir) { $tags += 'OnlineFix' }
+            $date = $null
+            if ($p.InstallDate -match '^\d{8}$') { $date = [datetime]::ParseExact($p.InstallDate, 'yyyyMMdd', $null).ToString('d MMM yyyy') }
+            $seen[$dir.ToLower()] = 1
+            $out += [pscustomobject]@{ Key = $name; KeyPath = "Registry::$($e.HiveName)\$($e.Sub)\$name"; Name = $p.DisplayName; Dir = $dir; UnExe = $unExe; Tags = $tags; IconSrc = ($p.DisplayIcon -split ',')[0].Trim('"'); Version = $p.DisplayVersion; Date = $date }
+        } catch { continue }
+    }
+
+    # folder-based games (OnlineFix releases are usually extracted, not installed)
+    $userRoots = @($script:cfg['folders'])
+    foreach ($r in $roots) {
+        $hits = @()
+        foreach ($c in $kids[$r]) {
+            $i++; if ($i % 6 -eq 0) { Step $i $total "Scanning game folders ($i of $total)..." }
+            if (Find-OFCached $c) { $hits += $c }
+        }
+        if (-not $hits -and ($userRoots -contains $r) -and (Find-OFCached $r)) { $hits = @($r) }
         foreach ($d in $hits) {
             try {
-            $dl = $d.ToLower().TrimEnd('\')
-            if ($seen[$dl] -or ($seen.Keys | Where-Object { $dl.StartsWith($_.TrimEnd('\') + '\') -or $_.TrimEnd('\').StartsWith($dl + '\') })) { continue }
-            $seen[$dl] = 1
-            $nm = ((Split-Path $d -Leaf) -replace '(?i)[-_. ]?online-?fix', '' -replace '[_\.]', ' ').Trim()
-            $un = Get-ChildItem -LiteralPath $d -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-            $out += New-Game "dir:$d" $null $nm $d $un @('OnlineFix') $null $null (Get-Item -LiteralPath $d).CreationTime.ToString('d MMM yyyy')
+                $dl = $d.ToLower().TrimEnd('\')
+                if ($seen[$dl] -or ($seen.Keys | Where-Object { $dl.StartsWith($_.TrimEnd('\') + '\') -or $_.TrimEnd('\').StartsWith($dl + '\') })) { continue }
+                $seen[$dl] = 1
+                $nm = ((Split-Path $d -Leaf) -replace '(?i)[-_. ]?online-?fix', '' -replace '[_\.]', ' ').Trim()
+                $un = Get-ChildItem -LiteralPath $d -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
+                $out += [pscustomobject]@{ Key = "dir:$d"; KeyPath = $null; Name = $nm; Dir = $d; UnExe = $un; Tags = @('OnlineFix'); IconSrc = $null; Version = $null; Date = (Get-Item -LiteralPath $d).CreationTime.ToString('d MMM yyyy') }
             } catch { continue }
         }
     }
+    Step $total $total 'Finishing...'
     $out | Sort-Object Name
+}
+function Build-Games($recs) {
+    $old = @{}
+    foreach ($g in $script:games) { $old[$g.Key] = $g }
+    foreach ($r in $recs) {
+        $o = $old[$r.Key]
+        if ($o -and $o.Dir -eq $r.Dir -and $o.Name -eq $r.Name -and $o.Tags -eq (@($r.Tags) -join ',')) { $o } else { New-Game $r }
+    }
 }
 
 # ---------- background workers (cover art + sizes) ----------
@@ -280,7 +365,7 @@ $w = [Windows.Markup.XamlReader]::Parse(@'
   </Grid>
   <Grid Grid.Row="1" Margin="14,4,0,0">
    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="350"/></Grid.ColumnDefinitions>
-   <ListBox x:Name="list" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" Margin="0,0,6,0">
+   <ListBox x:Name="list" Foreground="#F3F3F3" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" Margin="0,0,6,0">
     <ListBox.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ListBox.ItemsPanel>
     <ListBox.ItemTemplate><DataTemplate>
      <Grid Width="172" Height="258">
@@ -290,7 +375,7 @@ $w = [Windows.Markup.XamlReader]::Parse(@'
       
       <Rectangle RadiusX="10" RadiusY="10" Style="{StaticResource CoverRect}"><Rectangle.Fill><ImageBrush ImageSource="{Binding Cover}" Stretch="UniformToFill"/></Rectangle.Fill></Rectangle>
       <Border VerticalAlignment="Bottom" Height="96" CornerRadius="0,0,10,10"><Border.Background><LinearGradientBrush StartPoint="0,0" EndPoint="0,1"><GradientStop Color="#00000000" Offset="0"/><GradientStop Color="#E8000000" Offset="1"/></LinearGradientBrush></Border.Background>
-       <TextBlock Text="{Binding Name}" VerticalAlignment="Bottom" Margin="10,0,10,9" TextWrapping="Wrap" MaxHeight="38" FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/></Border>
+       <TextBlock Text="{Binding Name}" Foreground="White" VerticalAlignment="Bottom" Margin="10,0,10,9" TextWrapping="Wrap" MaxHeight="38" FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/></Border>
       <ItemsControl ItemsSource="{Binding Badges}" VerticalAlignment="Top" HorizontalAlignment="Left" Margin="8"><ItemsControl.ItemTemplate><DataTemplate>
        <Border Background="{Binding Color}" CornerRadius="9" Padding="8,2" Margin="0,0,0,4" HorizontalAlignment="Left"><TextBlock Text="{Binding Text}" FontSize="10.5" FontWeight="SemiBold" Foreground="White"/></Border>
       </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
@@ -359,22 +444,28 @@ function Refresh-List {
     if ($v.Count -eq 0) { $empty.Text = if ($script:games.Count -eq 0) { "No repack or OnlineFix games found yet.`nUse Folders to add the folder your games live in." } else { 'Nothing matches this filter' } }
     $detail.Visibility = 'Collapsed'; $empty.Visibility = 'Visible'
 }
-function Scan-And-Show {
+function Scan-And-Show($full = $false) {
     foreach ($p in $script:bg) { try { $p.PS.Stop() } catch {} }; $script:bg = @(); $script:miss = 0; $script:doneMsg = $false
-    $w.Cursor = 'Wait'; $status.Text = 'Scanning...'; $w.Dispatcher.Invoke([action]{}, 'Render')
-    $script:games = @(Scan); $script:byKey = @{}
+    if ($full) { $script:ofCache = @{}; $script:datCache = @{}; $script:exeCache = @{} }
+    $script:fullScan = $full; $script:scanning = $true; $btnScan.IsEnabled = $false; $w.Cursor = 'Wait'
+    $sig = { param($l) (@($l | ForEach-Object { "$($_.Key):$($_.Tags):$($_.Name):$($_.Dir)" }) -join '|') }
+    $before = & $sig $script:games
+    $recs = @(Scan)
+    $script:games = @(Build-Games $recs); $script:byKey = @{}
     foreach ($g in $script:games) { $script:byKey[$g.Key] = $g }
-    $w.Cursor = $null; Refresh-List
+    $script:scanning = $false; $btnScan.IsEnabled = $true; $w.Cursor = $null; $busy.IsIndeterminate = $true; $busy.Visibility = 'Collapsed'
+    if ($full -or $script:games.Count -eq 0 -or $before -ne (& $sig $script:games)) { Refresh-List }
     $cj = @(); $sj = @()
     foreach ($g in $script:games) {
         $c = Cache-Path $g.Key; $none = "$c.none"
-        $sj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir }
+        if (-not $g.Size -or $full) { $sj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir } }
         if (-not (Test-Path $c) -and -not ((Test-Path $none) -and ((Get-Item $none).LastWriteTime -gt (Get-Date).AddDays(-1)))) {
             $cj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir; Term = (Get-Term $g.Name); Cache = $c } }
     }
     if ($cj) { Start-Bg $coverSb $cj }
     if ($sj) { Start-Bg $sizeSb $sj }
     $status.Text = "Found $($script:games.Count) game(s). $(if ($cj) { 'Fetching cover art in the background...' })"
+    Save-Library
 }
 function Finish-Remove($i, $confirmed) {
     if (Test-Path -LiteralPath $i.Dir) {
@@ -449,9 +540,9 @@ $pump.Add_Tick({
         if ($m.T -eq 'cover') { $g.Cover = Load-Img $m.V } elseif ($m.T -eq 'size') { $g.Size = Fmt $m.V } else { $script:miss++ }
     }
     $run = @($script:bg | Where-Object { -not $_.H.IsCompleted }).Count -gt 0
-    $busy.Visibility = if ($run) { 'Visible' } else { 'Collapsed' }
+    if (-not $script:scanning) { $busy.Visibility = if ($run) { 'Visible' } else { 'Collapsed' } }
     if (-not $run -and $script:bg.Count -gt 0 -and -not $script:doneMsg) {
-        $script:doneMsg = $true
+        $script:doneMsg = $true; Save-Library
         $status.Text = if ($script:miss) { "No cover found for $($script:miss) game(s). Select one and use Find cover online." } else { 'All covers loaded.' }
     }
 })
@@ -473,7 +564,8 @@ $list.Add_SelectionChanged({
 $list.Add_MouseDoubleClick({ Play })
 $search.Add_TextChanged({ $ph.Visibility = if ($search.Text) { 'Collapsed' } else { 'Visible' }; Refresh-List })
 foreach ($rb in $chips.Children) { if ($rb -is [Windows.Controls.RadioButton]) { $rb.Add_Checked({ $script:filter = $args[0].Tag; Refresh-List }) } }
-$btnScan.Add_Click({ Scan-And-Show })
+$btnScan.ToolTip = 'Click: quick refresh. Shift+click: full rescan.'
+$btnScan.Add_Click({ Scan-And-Show (([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift) -ne 0) })
 $btnUpdate.Add_Click({ Check-Update $true })
 $btnUpd.Add_Click({ Install-Update })
 $btnLater.Add_Click({ $updBar.Visibility = 'Collapsed' })
@@ -529,5 +621,8 @@ $w.Add_SourceInitialized({
     $v = 1; [void][Dwm]::DwmSetWindowAttribute($h, 20, [ref]$v, 4)
     $c = 0x1D1B1B; [void][Dwm]::DwmSetWindowAttribute($h, 35, [ref]$c, 4)
 })
-$w.Add_ContentRendered({ if (-not $script:started) { $script:started = $true; Scan-And-Show; Check-Update $false } })
+$w.Add_ContentRendered({ if (-not $script:started) { $script:started = $true
+    Load-Library
+    if ($script:games.Count) { Refresh-List; $status.Text = "Loaded $($script:games.Count) game(s). Checking for changes..."; $w.Dispatcher.Invoke([action]{}, 'Render') }
+    Scan-And-Show; Check-Update $false } })
 [void]$w.ShowDialog()
