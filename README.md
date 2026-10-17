@@ -17,40 +17,6 @@ A Windows 11 style game library manager. It finds installed games, shows them as
 
 Repack Shelf checks for new versions each time it starts. When one is available a banner appears: click **Update now**. It downloads the new exe, verifies its SHA-256 checksum, replaces itself and restarts. You can also click **Updates** in the top bar at any time.
 
-## Publishing updates (for the maintainer)
-
-### One-time setup
-
-1. Create a **public** GitHub repository (for example `RepackShelf`) and push this folder to it:
-
-   ```
-   git init
-   git add .
-   git commit -m "Initial commit"
-   git branch -M main
-   git remote add origin https://github.com/YOUR-USERNAME/RepackShelf.git
-   git push -u origin main
-   ```
-
-2. In the repo go to **Settings > Actions > General > Workflow permissions** and choose **Read and write permissions**.
-
-Nothing needs editing in the code: the release workflow stamps your repository name and the version into the app when it builds.
-
-### Releasing a new version
-
-Commit your changes, then run:
-
-```
-release.bat 1.1.0
-```
-
-(or manually: `git push`, `git tag v1.1.0`, `git push origin v1.1.0`)
-
-GitHub Actions then builds `RepackShelf.exe`, creates a checksum file, and publishes a release with auto-generated notes. Every installed copy will offer the update the next time it starts. Version numbers must look like `1.2.3`.
-
-### Building locally
-
-Double-click `build.bat`. The exe appears in `dist\`. Local builds are marked "dev build" and have update checking turned off. You can also run `src\RepackShelf.ps1` directly with PowerShell.
 
 ## How updating works
 
