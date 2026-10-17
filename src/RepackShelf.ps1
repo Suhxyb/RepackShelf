@@ -1,4 +1,4 @@
-$AppVersion = '__VERSION__'; $RepoSlug = '__REPO__'
+﻿$AppVersion = '__VERSION__'; $RepoSlug = '__REPO__'
 Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System.Drawing,System.Windows.Forms
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -14,8 +14,14 @@ public class RsGame : INotifyPropertyChanged {
   public string UnExe {get;set;} public string Exe {get;set;} public string Version {get;set;} public string Date {get;set;} public string Tags {get;set;}
   public object Badges {get;set;} public object Icon {get;set;} public string Accent {get;set;} public string Letter {get;set;} public string IconSrc {get;set;}
   object cover; public object Cover { get { return cover; } set { cover = value; N("Cover"); } }
-  string size; public string Size { get { return size; } set { size = value; N("Meta"); } }
-  public string Meta { get { return "Folder   " + Dir + "\nSize   " + (Size ?? "calculating...") + "\nVersion   " + (Version ?? "n/a") + "\nInstalled   " + (Date ?? "n/a") + "\nLaunches   " + (Exe ?? "no executable found - use Set .exe"); } }
+  string size; public string Size { get { return size; } set { size = value; N("Meta"); N("SizeText"); } } public string SizeText { get { return size ?? "..."; } } public long Bytes {get;set;} public long DateTicks {get;set;}
+  string gen; public string Genres { get { return gen; } set { gen = value; N("Genres"); N("Meta"); } }
+  public long NewsDate {get;set;} public string NewsTitle {get;set;} public string NewsUrl {get;set;}
+  string upd; public string UpdText { get { return upd; } set { upd = value; N("UpdText"); N("Meta"); } }
+  bool hasUpd; public bool HasUpd { get { return hasUpd; } set { hasUpd = value; N("HasUpd"); } }
+  bool fav; public bool Fav { get { return fav; } set { fav = value; N("Fav"); N("FavMark"); } } public string FavMark { get { return fav ? "\u2605" : ""; } }
+  public string TagLine { get { return (Tags ?? "").Replace(",", "  \u00B7  "); } }
+  public string Meta { get { return "Folder   " + Dir + "\nSize   " + (Size ?? "calculating...") + "\nVersion   " + (Version ?? "n/a") + "\nInstalled   " + (Date ?? "n/a") + "\nLaunches   " + (Exe ?? "no executable found - use Set .exe") + (string.IsNullOrEmpty(gen) ? "" : "\nGenres   " + gen.Replace(",", ", ")) + (string.IsNullOrEmpty(upd) ? "" : "\nNew patch notes   " + upd); } }
 }
 '@
 
@@ -27,7 +33,7 @@ $script:cfg = @{}
 if (Test-Path $cfgPath) { try { (Get-Content $cfgPath -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $script:cfg[$_.Name] = $_.Value } } catch {} }
 function Save-Cfg { $script:cfg | ConvertTo-Json | Set-Content $cfgPath }
 $libPath = Join-Path $appDir 'library.json'
-$script:ofCache = @{}; $script:datCache = @{}; $script:exeCache = @{}; $script:fullScan = $false; $script:scanning = $false
+$script:ofCache = @{}; $script:datCache = @{}; $script:exeCache = @{}; $script:fullScan = $false; $script:scanning = $false; $script:sort = 'Name'; $script:favOnly = $false; $script:updOnly = $false; $script:updDirty = $false; $script:cfgDirty = $false; $script:genres = @(); $script:genDirty = $false; $script:view = 'Grid'; $script:animK = 1.0
 
 # ---------- helpers ----------
 function Fmt($b) { if ($b -ge 1GB) { '{0:N1} GB' -f ($b / 1GB) } else { '{0:N0} MB' -f ($b / 1MB) } }
@@ -70,7 +76,7 @@ function Step($i, $total, $text) {
 }
 function Save-Library {
     try {
-        $recs = @($script:games | ForEach-Object { [pscustomobject]@{ Key = $_.Key; KeyPath = $_.KeyPath; Name = $_.Name; Dir = $_.Dir; UnExe = $_.UnExe; Tags = $_.Tags; Exe = $_.Exe; IconSrc = $_.IconSrc; Version = $_.Version; Date = $_.Date; Size = $_.Size } })
+        $recs = @($script:games | ForEach-Object { [pscustomobject]@{ Key = $_.Key; KeyPath = $_.KeyPath; Name = $_.Name; Dir = $_.Dir; UnExe = $_.UnExe; Tags = $_.Tags; Exe = $_.Exe; IconSrc = $_.IconSrc; Version = $_.Version; Date = $_.Date; Size = $_.Size; Bytes = $_.Bytes; DateTicks = $_.DateTicks } })
         [pscustomobject]@{ v = 1; games = $recs; of = $script:ofCache; dat = $script:datCache } | ConvertTo-Json -Depth 4 | Set-Content $libPath -Encoding UTF8
     } catch {}
 }
@@ -84,9 +90,9 @@ function Load-Library {
         foreach ($r in @($d.games)) {
             if (-not $r.Dir -or -not (Test-Path -LiteralPath $r.Dir) -or "$($r.Tags)" -eq 'Inno') { continue }
             $script:exeCache[$r.Key] = $r.Exe
-            $rec = [pscustomobject]@{ Key = $r.Key; KeyPath = $r.KeyPath; Name = $r.Name; Dir = $r.Dir; UnExe = $r.UnExe; Tags = @("$($r.Tags)" -split ','); IconSrc = $r.IconSrc; Version = $r.Version; Date = $r.Date }
+            $rec = [pscustomobject]@{ Key = $r.Key; KeyPath = $r.KeyPath; Name = $r.Name; Dir = $r.Dir; UnExe = $r.UnExe; Tags = @("$($r.Tags)" -split ','); IconSrc = $r.IconSrc; Version = $r.Version; Date = $r.Date; DateTicks = $r.DateTicks }
             $g = New-Game $rec
-            if ($r.Size) { $g.Size = $r.Size }
+            if ($r.Size) { $g.Size = $r.Size }; $g.Bytes = [long]$r.Bytes
             $games += $g
         }
         $script:games = $games; $script:byKey = @{}
@@ -118,6 +124,17 @@ function Load-Img($path) {
 # ---------- detection ----------
 $TagColor = @{ FitGirl = '#C2185B'; DODI = '#1976D2'; Repack = '#6A1B9A'; OnlineFix = '#2E7D32'; Inno = '#555555' }
 $TagText = @{ FitGirl = 'FitGirl'; DODI = 'DODI'; Repack = 'Repack'; OnlineFix = 'OnlineFix'; Inno = 'Inno Setup' }
+# Compares Steam's newest developer patch-note post with the date the game was installed.
+# It cannot read the installed build, so this is a hint; "Dismiss update notice" clears it.
+function Set-UpdState($g) {
+    $g.HasUpd = $false; $g.UpdText = ''
+    if ($g.NewsDate -le 0 -or $g.DateTicks -le 0) { return }
+    $sk = "seen:$($g.Key)"; $seen = [long]("0" + [string]$script:cfg[$sk])
+    $pd = [DateTimeOffset]::FromUnixTimeSeconds($g.NewsDate).LocalDateTime
+    if ($g.NewsDate -gt $seen -and $pd.Ticks -gt ($g.DateTicks + [TimeSpan]::FromDays(1).Ticks)) {
+        $g.HasUpd = $true; $g.UpdText = "$($pd.ToString('d MMM yyyy')) - $($g.NewsTitle)"
+    }
+}
 function New-Game($r) {
     $tags = @($r.Tags)
     $g = New-Object RsGame
@@ -129,6 +146,7 @@ function New-Game($r) {
     $ico = $r.IconSrc
     if (-not $ico -or $ico -match '[<>|"*?]' -or -not (Test-Path -LiteralPath $ico) -or $ico -match 'unins') { $ico = $exe }
     $g.IconSrc = $ico
+    $g.DateTicks = [long]$r.DateTicks; $gk = "gen:$($r.Key)"; $gv = "$($script:cfg[$gk])"; if ($gv -and $gv -ne '-') { $g.Genres = $gv }; $nk = $r.Key; $g.NewsDate = [long]("0" + [string]$script:cfg["nd:$nk"]); $g.NewsTitle = [string]$script:cfg["nt:$nk"]; $g.NewsUrl = [string]$script:cfg["nu:$nk"]; Set-UpdState $g; $g.Fav = [bool]$script:cfg["fav:$($r.Key)"]
     if ($ico) { $g.Icon = Get-Icon $ico }
     $g.Badges = @($tags | ForEach-Object { New-Object RsBadge -Property @{ Text = $TagText[$_]; Color = $TagColor[$_] } })
     $c = Cache-Path $r.Key
@@ -182,10 +200,12 @@ function Scan {
             if ($dir) { $dir = $dir.Trim() }
             if (-not $dir -or $dir -match '[<>|"*?]' -or -not (Test-Path -LiteralPath $dir) -or $seen[$dir.ToLower()]) { continue }
             if (Find-OFCached $dir) { $tags += 'OnlineFix' }
-            $date = $null
-            if ($p.InstallDate -match '^\d{8}$') { $date = [datetime]::ParseExact($p.InstallDate, 'yyyyMMdd', $null).ToString('d MMM yyyy') }
+            $dt = $null
+            if ($p.InstallDate -match '^\d{8}$') { try { $dt = [datetime]::ParseExact($p.InstallDate, 'yyyyMMdd', $null) } catch {} }
+            if (-not $dt) { try { $dt = (Get-Item -LiteralPath $dir).CreationTime } catch {} }
+            $date = if ($dt) { $dt.ToString('d MMM yyyy') } else { $null }; $dticks = if ($dt) { $dt.Ticks } else { 0 }
             $seen[$dir.ToLower()] = 1
-            $out += [pscustomobject]@{ Key = $name; KeyPath = "Registry::$($e.HiveName)\$($e.Sub)\$name"; Name = $p.DisplayName; Dir = $dir; UnExe = $unExe; Tags = $tags; IconSrc = ($p.DisplayIcon -split ',')[0].Trim('"'); Version = $p.DisplayVersion; Date = $date }
+            $out += [pscustomobject]@{ Key = $name; KeyPath = "Registry::$($e.HiveName)\$($e.Sub)\$name"; Name = $p.DisplayName; Dir = $dir; UnExe = $unExe; Tags = $tags; IconSrc = ($p.DisplayIcon -split ',')[0].Trim('"'); Version = $p.DisplayVersion; Date = $date; DateTicks = $dticks }
         } catch { continue }
     }
 
@@ -204,8 +224,9 @@ function Scan {
                 if ($seen[$dl] -or ($seen.Keys | Where-Object { $dl.StartsWith($_.TrimEnd('\') + '\') -or $_.TrimEnd('\').StartsWith($dl + '\') })) { continue }
                 $seen[$dl] = 1
                 $nm = ((Split-Path $d -Leaf) -replace '(?i)[-_. ]?online-?fix', '' -replace '[_\.]', ' ').Trim()
+                $cd = (Get-Item -LiteralPath $d).CreationTime
                 $un = Get-ChildItem -LiteralPath $d -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty FullName
-                $out += [pscustomobject]@{ Key = "dir:$d"; KeyPath = $null; Name = $nm; Dir = $d; UnExe = $un; Tags = @('OnlineFix'); IconSrc = $null; Version = $null; Date = (Get-Item -LiteralPath $d).CreationTime.ToString('d MMM yyyy') }
+                $out += [pscustomobject]@{ Key = "dir:$d"; KeyPath = $null; Name = $nm; Dir = $d; UnExe = $un; Tags = @('OnlineFix'); IconSrc = $null; Version = $null; Date = $cd.ToString('d MMM yyyy'); DateTicks = $cd.Ticks }
             } catch { continue }
         }
     }
@@ -217,7 +238,7 @@ function Build-Games($recs) {
     foreach ($g in $script:games) { $old[$g.Key] = $g }
     foreach ($r in $recs) {
         $o = $old[$r.Key]
-        if ($o -and $o.Dir -eq $r.Dir -and $o.Name -eq $r.Name -and $o.Tags -eq (@($r.Tags) -join ',')) { $o } else { New-Game $r }
+        if ($o -and $o.Dir -eq $r.Dir -and $o.Name -eq $r.Name -and $o.Tags -eq (@($r.Tags) -join ',')) { $o.DateTicks = [long]$r.DateTicks; $o } else { New-Game $r }
     }
 }
 
@@ -240,6 +261,47 @@ $coverSb = {
         if (-not $hit -and $loose) { $hit = $c | Select-Object -First 1 }
         if ($hit) { $hit.Id }
     }
+    $gmap = @{
+        'horror'='Horror'; 'survival horror'='Horror'; 'psychological horror'='Horror'; 'action'='Action'; 'adventure'='Adventure'; 'rpg'='RPG'; 'action rpg'='RPG'; 'jrpg'='RPG'
+        'strategy'='Strategy'; 'rts'='Strategy'; 'simulation'='Simulation'; 'sports'='Sports'; 'racing'='Racing'; 'driving'='Racing'; 'puzzle'='Puzzle'
+        'platformer'='Platformer'; '2d platformer'='Platformer'; '3d platformer'='Platformer'; 'shooter'='Shooter'; 'fps'='Shooter'; 'third-person shooter'='Shooter'; 'first-person shooter'='Shooter'
+        'survival'='Survival'; 'open world'='Open World'; 'sandbox'='Sandbox'; 'roguelike'='Roguelike'; 'roguelite'='Roguelike'; 'rogue-like'='Roguelike'; 'rogue-lite'='Roguelike'
+        'fighting'='Fighting'; 'stealth'='Stealth'; 'story rich'='Story Rich'; 'casual'='Casual'; 'souls-like'='Soulslike'; 'soulslike'='Soulslike'; 'metroidvania'='Metroidvania'
+        'turn-based'='Turn-Based'; 'turn-based strategy'='Turn-Based'; 'turn-based combat'='Turn-Based'; 'tower defense'='Tower Defense'; 'city builder'='Building'; 'base building'='Building'; 'building'='Building'
+        'sci-fi'='Sci-fi'; 'fantasy'='Fantasy'; 'cyberpunk'='Cyberpunk'; 'zombies'='Zombies'; 'anime'='Anime'; 'visual novel'='Visual Novel'; 'hack and slash'='Hack and Slash'; 'walking simulator'='Walking Sim'
+        'co-op'='Co-op'; 'online co-op'='Co-op'; 'local co-op'='Co-op'; 'co-op campaign'='Co-op'; 'lan co-op'='Co-op'; 'shared/split screen co-op'='Co-op'
+        'multiplayer'='Multiplayer'; 'multi-player'='Multiplayer'; 'cross-platform multiplayer'='Multiplayer'; 'pvp'='PvP'; 'online pvp'='PvP'; 'massively multiplayer'='MMO'; 'mmorpg'='MMO'
+        'singleplayer'='Singleplayer'; 'single-player'='Singleplayer'
+    }
+    $gfetch = {
+        param($id)
+        $ok = $false; $tags = @(); $more = @()
+        try {
+            $r = Invoke-WebRequest -Uri "https://store.steampowered.com/app/$id/?l=english" -UseBasicParsing -TimeoutSec 20 -Headers @{ Cookie = 'birthtime=568022401; lastagecheckage=1-0-1988; wants_mature_content=1' }
+            $ok = $true
+            foreach ($m in [regex]::Matches($r.Content, '(?s)class="app_tag"[^>]*>\s*([^<]+?)\s*</a>')) { $tags += [Net.WebUtility]::HtmlDecode($m.Groups[1].Value) }
+        } catch {}
+        if ($tags.Count -eq 0) {
+            try {
+                $r = Invoke-RestMethod -Uri "https://steamspy.com/api.php?request=appdetails&appid=$id" -TimeoutSec 20; $ok = $true
+                if ($r.tags) { $tags += @($r.tags.PSObject.Properties | Sort-Object { [int]$_.Value } -Descending | ForEach-Object { $_.Name }) }
+            } catch {}
+            Start-Sleep -Milliseconds 1100
+        }
+        try {
+            $d = Invoke-RestMethod -Uri "https://store.steampowered.com/api/appdetails?appids=$id&l=english" -TimeoutSec 15; $ok = $true
+            $x = $d.$id.data
+            if ($x) { foreach ($n in (@($x.genres) + @($x.categories))) { if ($n -and $n.description) { $more += $n.description } } }
+        } catch {}
+        if (-not $ok) { return $null }
+        $res = @()
+        foreach ($n in (@($tags | Select-Object -First 15) + $more)) {
+            $c = $gmap["$n".ToLower().Trim()]
+            if ($c -and $res -notcontains $c) { $res += $c }
+            if ($res.Count -ge 7) { break }
+        }
+        ($res -join ',')
+    }
     foreach ($j in $jobs) {
         try {
             $id = $null
@@ -259,13 +321,16 @@ $coverSb = {
                 if (-not $id -and $vars) { $id = & $search $vars[0] $true }
             }
             $ok = $false
-            if ($id) {
+            if ($id -and -not $j.SkipCover) {
                 $base = "https://cdn.cloudflare.steamstatic.com/steam/apps/$id/"
                 foreach ($u in 'library_600x900_2x.jpg', 'library_600x900.jpg', 'header.jpg', 'capsule_616x353.jpg') { if (& $get ($base + $u) $j.Cache) { $ok = $true; break } }
                 if (-not $ok) { try { $d = Invoke-RestMethod -Uri "https://store.steampowered.com/api/appdetails?appids=$id" -TimeoutSec 15; $img = $d.$id.data.header_image; if ($img -and (& $get $img $j.Cache)) { $ok = $true } } catch {} }
             }
-            if ($ok) { $q.Enqueue([pscustomobject]@{ T = 'cover'; K = $j.Key; V = $j.Cache }) }
-            else { if (-not $id) { Set-Content "$($j.Cache).none" '' }; $q.Enqueue([pscustomobject]@{ T = 'miss'; K = $j.Key }) }
+            if ($j.NeedGenres) { $gl = if ($id) { & $gfetch $id } else { '' }; $q.Enqueue([pscustomobject]@{ T = 'genre'; K = $j.Key; V = $gl; Id = $id }) }
+            if (-not $j.SkipCover) {
+                if ($ok) { $q.Enqueue([pscustomobject]@{ T = 'cover'; K = $j.Key; V = $j.Cache; Id = $id }) }
+                else { if (-not $id) { Set-Content "$($j.Cache).none" '' }; $q.Enqueue([pscustomobject]@{ T = 'miss'; K = $j.Key }) }
+            }
         } catch {}
     }
 }
@@ -294,6 +359,34 @@ function Start-Bg($sb, $jobs, $track = $true) {
     $ps = [powershell]::Create(); $ps.Runspace = $rs
     [void]$ps.AddScript($sb.ToString()).AddArgument($jobs).AddArgument($script:q)
     if ($track) { $script:bg += [pscustomobject]@{ PS = $ps; H = $ps.BeginInvoke() } } else { [void]$ps.BeginInvoke() }
+}
+
+# ---------- update checker (Steam developer patch notes) ----------
+$newsSb = {
+    param($jobs, $q)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    foreach ($j in $jobs) {
+        try {
+            $r = Invoke-RestMethod -Uri "https://api.steampowered.com/ISteamNews/GetNewsForApp/v2/?appid=$($j.Id)&count=25&maxlength=1&feeds=steam_community_announcements&format=json" -TimeoutSec 20
+            $best = $null
+            foreach ($n in @($r.appnews.newsitems)) {
+                if ($n.title -match '(?i)\b(patch|hotfix|update|changelog|change log|release notes|version|build)\b|\bv?\d+\.\d+' -and $n.title -notmatch '(?i)\bsale\b|giveaway|livestream|dev stream|developer stream') {
+                    if (-not $best -or [long]$n.date -gt [long]$best.date) { $best = $n }
+                }
+            }
+            $q.Enqueue([pscustomobject]@{ T = 'news'; K = $j.Key; Ok = $true; Date = $(if ($best) { [long]$best.date } else { 0 }); Title = $(if ($best) { "$($best.title)" } else { '' }); Url = $(if ($best) { "$($best.url)" } else { '' }) })
+        } catch { $q.Enqueue([pscustomobject]@{ T = 'news'; K = $j.Key; Ok = $false }) }
+    }
+}
+function Start-NewsCheck($force = $false) {
+    $now = [DateTime]::UtcNow.Ticks; $jobs = @()
+    foreach ($g in $script:games) {
+        $id = "$($script:cfg['app:' + $g.Key])"; if ($id -notmatch '^\d+$') { continue }
+        $last = [long]("0" + [string]$script:cfg["newschk:$($g.Key)"])
+        if (-not $force -and $last -gt 0 -and ($now - $last) -lt [TimeSpan]::FromHours(6).Ticks) { continue }
+        $jobs += [pscustomobject]@{ Key = $g.Key; Id = $id }
+    }
+    if ($jobs) { Start-Bg $newsSb $jobs }
 }
 
 # ---------- UI ----------
@@ -330,15 +423,17 @@ function Apply-Theme {
     $c = [Windows.Media.ColorConverter]::ConvertFromString($acc)
     Set-Res 'UiAccentFg' (New-Brush $(if ((0.299 * $c.R + 0.587 * $c.G + 0.114 * $c.B) -gt 150) { '#101010' } else { '#FFFFFF' }))
     if ("$($script:cfg['ui:bg'])" -eq 'Glow') {
-        $gb = [Windows.Media.LinearGradientBrush]::new(); $gb.StartPoint = '0,0'; $gb.EndPoint = '1,1'
+        $gb = [Windows.Media.LinearGradientBrush]::new(); $gb.StartPoint = [Windows.Point]::new(0, 0); $gb.EndPoint = [Windows.Point]::new(1, 1)
         $f = if ($t.IsDark) { 0.22 } else { 0.14 }
         [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop (Mix $t.Bg $acc $f), 0.0))
         [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($t.Bg)), 0.62))
         $gb.Freeze(); Set-Res 'UiWinBg' $gb
     } else { Set-Res 'UiWinBg' (New-Brush $t.Bg) }
-    $sz = switch ("$($script:cfg['ui:size'])") { 'Small' { 140, 210 } 'Large' { 212, 318 } default { 172, 258 } }
+    $sz = switch ("$($script:cfg['ui:size'])") { 'Small' { 180, 270 } 'Large' { 270, 405 } default { 224, 336 } }
     Set-Res 'UiPW' ([double]$sz[0]); Set-Res 'UiPH' ([double]$sz[1])
-    $script:animOn = "$($script:cfg['ui:anim'])" -ne 'Off'
+    $an = "$($script:cfg['ui:anim'])"; $script:animOn = $an -ne 'Off'; $script:animK = switch ($an) { 'Fast' { 0.6 } 'Relaxed' { 1.7 } default { 1.0 } }
+    $rd = switch ("$($script:cfg['ui:round'])") { 'Sharp' { 4 } 'Round' { 18 } default { 10 } }
+    Set-Res 'UiRad' ([double]$rd); Set-Res 'UiRadD' ([double]($rd + 2)); Set-Res 'UiRadB' ([Windows.CornerRadius]::new(0, 0, $rd, $rd)); Set-Res 'UiRadS' ([Windows.CornerRadius]::new($rd + 2))
     $script:themeBg = $t.Bg; $script:themeDark = [bool]$t.IsDark
     Set-TitleBar
 }
@@ -346,7 +441,7 @@ function Anim-Slide($el, $axis, $from, $ms = 350, $delay = 0) {
     if (-not $script:animOn) { $el.Opacity = 1; $el.RenderTransform = $null; return }
     if ($delay -gt 0) { $el.Opacity = 0 }
     $tt = New-Object Windows.Media.TranslateTransform; $el.RenderTransform = $tt
-    $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds($ms)); $ea = New-Object Windows.Media.Animation.CubicEase; $ea.EasingMode = 'EaseOut'
+    $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds($ms * $script:animK)); $ea = New-Object Windows.Media.Animation.CubicEase; $ea.EasingMode = 'EaseOut'
     $a = New-Object Windows.Media.Animation.DoubleAnimation 0, 1, $dur; $a.BeginTime = [TimeSpan]::FromMilliseconds($delay)
     $b = New-Object Windows.Media.Animation.DoubleAnimation $from, 0, $dur; $b.EasingFunction = $ea; $b.BeginTime = $a.BeginTime
     $el.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
@@ -355,7 +450,7 @@ function Anim-Slide($el, $axis, $from, $ms = 350, $delay = 0) {
 }
 function Fade($el, $from, $ms) {
     if (-not $script:animOn) { return }
-    $a = New-Object Windows.Media.Animation.DoubleAnimation $from, 1, (New-Object Windows.Duration ([TimeSpan]::FromMilliseconds($ms)))
+    $a = New-Object Windows.Media.Animation.DoubleAnimation $from, 1, (New-Object Windows.Duration ([TimeSpan]::FromMilliseconds($ms * $script:animK)))
     $el.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
 }
 $app = [Windows.Application]::Current; if (-not $app) { $app = New-Object Windows.Application }
@@ -384,11 +479,9 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
  </Style>
  <Style TargetType="ListBoxItem">
   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem">
-   <Border x:Name="b" CornerRadius="12" Padding="3" Margin="5" BorderThickness="2" BorderBrush="Transparent" Background="Transparent" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform><ContentPresenter/></Border>
+   <Border x:Name="b" CornerRadius="{DynamicResource UiRadS}" Padding="3" Margin="5" BorderThickness="2" BorderBrush="Transparent" Background="Transparent" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform><ContentPresenter/></Border>
    <ControlTemplate.Triggers>
-    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource UiHover}"/>
-    <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.045" Duration="0:0:0.14"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.045" Duration="0:0:0.14"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
-    <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.18"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.18"/></Storyboard></BeginStoryboard></Trigger.ExitActions></Trigger>
+    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource UiHover}"/></Trigger>
     <Trigger Property="IsSelected" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="{DynamicResource UiAccent}"/></Trigger>
    </ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
  </Style>
@@ -403,9 +496,42 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
     <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.15"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.15"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
    </Trigger></ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
  </Style>
+ <Style x:Key="HeartBtn" TargetType="ToggleButton"><Setter Property="Cursor" Value="Hand"/><Setter Property="Focusable" Value="False"/><Setter Property="Background" Value="#99000000"/><Setter Property="Foreground" Value="White"/>
+  <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ToggleButton">
+   <Border x:Name="b" Width="38" Height="38" CornerRadius="19" Background="{TemplateBinding Background}" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform>
+    <Path x:Name="h" Width="20" Height="20" Stretch="Uniform" StrokeThickness="1.7" StrokeLineJoin="Round" Stroke="{TemplateBinding Foreground}" Fill="Transparent" Data="M12,21.35 L10.55,20.03 C5.4,15.36 2,12.28 2,8.5 C2,5.42 4.42,3 7.5,3 C9.24,3 10.91,3.81 12,5.09 C13.09,3.81 14.76,3 16.5,3 C19.58,3 22,5.42 22,8.5 C22,12.28 18.6,15.36 13.45,20.04 Z"/></Border>
+   <ControlTemplate.Triggers>
+    <Trigger Property="IsChecked" Value="True"><Setter TargetName="h" Property="Fill" Value="{DynamicResource UiAccent}"/><Setter TargetName="h" Property="Stroke" Value="{DynamicResource UiAccent}"/></Trigger>
+    <Trigger Property="IsMouseOver" Value="True">
+     <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.12" Duration="0:0:0.1"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.12" Duration="0:0:0.1"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
+     <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.12"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.12"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
+    </Trigger>
+   </ControlTemplate.Triggers></ControlTemplate></Setter.Value></Setter>
+ </Style>
+ <Style x:Key="ToggleChip" TargetType="ToggleButton"><Setter Property="Margin" Value="0,0,6,0"/><Setter Property="Cursor" Value="Hand"/>
+  <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ToggleButton">
+   <Border x:Name="b" Background="{DynamicResource UiCard}" CornerRadius="15" Padding="14,6"><TextBlock x:Name="t" Text="{TemplateBinding Content}" FontSize="12.5" Foreground="{DynamicResource UiChipText}"/></Border>
+   <ControlTemplate.Triggers><Trigger Property="IsChecked" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource UiAccent}"/><Setter TargetName="t" Property="Foreground" Value="{DynamicResource UiAccentFg}"/></Trigger></ControlTemplate.Triggers>
+  </ControlTemplate></Setter.Value></Setter>
+ </Style>
  <Style x:Key="CoverRect" TargetType="Rectangle"><Style.Triggers><DataTrigger Binding="{Binding Cover}" Value="{x:Null}"><Setter Property="Opacity" Value="0"/>
   <DataTrigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.7"/></Storyboard></BeginStoryboard></DataTrigger.ExitActions>
  </DataTrigger></Style.Triggers></Style>
+ <ItemsPanelTemplate x:Key="PanelStack"><StackPanel/></ItemsPanelTemplate>
+ <DataTemplate x:Key="TplList">
+  <Grid Height="100" Margin="6,0">
+   <Grid.ColumnDefinitions><ColumnDefinition Width="82"/><ColumnDefinition Width="*"/><ColumnDefinition Width="130"/><ColumnDefinition Width="150"/><ColumnDefinition Width="54"/></Grid.ColumnDefinitions>
+   <Grid Width="62" Height="88" HorizontalAlignment="Left">
+    <Rectangle RadiusX="8" RadiusY="8" Fill="{Binding Accent}"/>
+    <TextBlock Text="{Binding Letter}" FontSize="30" FontWeight="Bold" Foreground="#44FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    <Rectangle RadiusX="8" RadiusY="8" Style="{StaticResource CoverRect}"><Rectangle.Fill><ImageBrush ImageSource="{Binding Cover}" Stretch="UniformToFill"/></Rectangle.Fill></Rectangle>
+   </Grid>
+   <StackPanel Grid.Column="1" VerticalAlignment="Center"><TextBlock Text="{Binding Name}" FontSize="19" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/><TextBlock Text="{Binding TagLine}" FontSize="14" Foreground="{DynamicResource UiMuted}" Margin="0,5,0,0"/></StackPanel>
+   <TextBlock Grid.Column="2" Text="{Binding SizeText}" VerticalAlignment="Center" Foreground="{DynamicResource UiSub}" FontSize="16"/>
+   <TextBlock Grid.Column="3" Text="{Binding Date}" VerticalAlignment="Center" Foreground="{DynamicResource UiSub}" FontSize="16"/>
+   <ToggleButton Grid.Column="4" Tag="heart" IsChecked="{Binding Fav, Mode=TwoWay}" Style="{StaticResource HeartBtn}" Background="{DynamicResource UiCard}" Foreground="{DynamicResource UiSub}" VerticalAlignment="Center" HorizontalAlignment="Center" ToolTip="Favourite"/>
+  </Grid>
+ </DataTemplate>
 </ResourceDictionary>
 '@)
 Apply-Theme
@@ -430,37 +556,58 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
     <TextBlock x:Name="count" Foreground="{DynamicResource UiMuted}" VerticalAlignment="Center" Margin="10,0,0,0"/>
    </StackPanel>
    <StackPanel Grid.Column="3" Orientation="Horizontal">
-    <Button x:Name="btnCustom" Content="Customise" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
-    <Button x:Name="btnUpdate" Content="Updates" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
-    <Button x:Name="btnFold" Content="Folders" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
+    <Button x:Name="btnCustom" Content="Settings" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
     <Button x:Name="btnScan" Content="Rescan" Style="{StaticResource Btn}" Margin="0"/>
    </StackPanel>
   </Grid>
   <Grid Grid.Row="1" Margin="14,4,0,0">
    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="350"/></Grid.ColumnDefinitions>
-   <ListBox x:Name="list" Foreground="{DynamicResource UiText}" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" Margin="0,0,6,0">
+   <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+    <StackPanel Margin="8,0,0,6">
+     <WrapPanel>
+      <TextBlock Text="SORT" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}" VerticalAlignment="Center" Margin="0,0,10,6"/>
+      <StackPanel x:Name="sortChips" Orientation="Horizontal" Margin="0,0,0,6"><RadioButton Content="Name" Tag="Name" GroupName="so" IsChecked="True" Style="{StaticResource Chip}"/><RadioButton Content="Size" Tag="Size" GroupName="so" Style="{StaticResource Chip}"/><RadioButton Content="Date" Tag="Date" GroupName="so" Style="{StaticResource Chip}"/></StackPanel>
+      <TextBlock Text="VIEW" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}" VerticalAlignment="Center" Margin="0,0,10,6"/>
+      <StackPanel x:Name="viewChips" Orientation="Horizontal" Margin="20,0,20,6"><RadioButton Content="Grid" Tag="Grid" GroupName="vw" IsChecked="True" Style="{StaticResource Chip}"/><RadioButton Content="List" Tag="List" GroupName="vw" Style="{StaticResource Chip}"/></StackPanel>
+      <ToggleButton x:Name="favChip" Content="Favourites" Style="{StaticResource ToggleChip}" Margin="0,0,6,6"/>
+      <ToggleButton x:Name="genreBtn" Content="Genre" Visibility="Collapsed" Style="{StaticResource ToggleChip}" Margin="0,0,6,6"/>
+      <ToggleButton x:Name="updChip" Content="Updates" Visibility="Collapsed" Style="{StaticResource ToggleChip}" Margin="0,0,6,6"/>
+      <Popup x:Name="genrePop" PlacementTarget="{Binding ElementName=genreBtn}" Placement="Bottom" StaysOpen="False" AllowsTransparency="True" PopupAnimation="Fade">
+       <Border Margin="0,6,14,14" Width="430" Background="{DynamicResource UiPanel2}" BorderBrush="{DynamicResource UiCard}" BorderThickness="1" CornerRadius="12" Padding="14,14,14,6">
+        <Border.Effect><DropShadowEffect BlurRadius="14" ShadowDepth="2" Opacity="0.45"/></Border.Effect>
+        <StackPanel><WrapPanel x:Name="catChips"/><Button x:Name="genreClear" Content="Clear genres" Style="{StaticResource Btn}" Padding="12,6" Margin="0,2,0,8" HorizontalAlignment="Left"/></StackPanel>
+       </Border></Popup>
+     </WrapPanel>
+    </StackPanel>
+    <ListBox Grid.Row="1" x:Name="list" Foreground="{DynamicResource UiText}" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" Margin="0,0,6,0">
     <ListBox.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ListBox.ItemsPanel>
     <ListBox.ItemTemplate><DataTemplate>
      <Grid Width="{DynamicResource UiPW}" Height="{DynamicResource UiPH}">
-      <Rectangle RadiusX="10" RadiusY="10" Fill="{Binding Accent}"/>
-      <TextBlock Text="{Binding Letter}" FontSize="76" FontWeight="Bold" Foreground="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-40,0,0"/>
-      <Image Source="{Binding Icon}" Width="48" Height="48" Margin="0,60,0,0" Opacity="0.9"/>
+      <Rectangle RadiusX="{DynamicResource UiRad}" RadiusY="{DynamicResource UiRad}" Fill="{Binding Accent}"/>
+      <TextBlock Text="{Binding Letter}" FontSize="96" FontWeight="Bold" Foreground="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-40,0,0"/>
+      <Image Source="{Binding Icon}" Width="56" Height="56" Margin="0,70,0,0" Opacity="0.9"/>
       
-      <Rectangle RadiusX="10" RadiusY="10" Style="{StaticResource CoverRect}"><Rectangle.Fill><ImageBrush ImageSource="{Binding Cover}" Stretch="UniformToFill"/></Rectangle.Fill></Rectangle>
-      <Border VerticalAlignment="Bottom" Height="96" CornerRadius="0,0,10,10"><Border.Background><LinearGradientBrush StartPoint="0,0" EndPoint="0,1"><GradientStop Color="#00000000" Offset="0"/><GradientStop Color="#E8000000" Offset="1"/></LinearGradientBrush></Border.Background>
-       <TextBlock Text="{Binding Name}" Foreground="White" VerticalAlignment="Bottom" Margin="10,0,10,9" TextWrapping="Wrap" MaxHeight="38" FontSize="13" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/></Border>
+      <Rectangle RadiusX="{DynamicResource UiRad}" RadiusY="{DynamicResource UiRad}" Style="{StaticResource CoverRect}"><Rectangle.Fill><ImageBrush ImageSource="{Binding Cover}" Stretch="UniformToFill"/></Rectangle.Fill></Rectangle>
+      <Border VerticalAlignment="Bottom" Height="130" CornerRadius="{DynamicResource UiRadB}"><Border.Background><LinearGradientBrush StartPoint="0,0" EndPoint="0,1"><GradientStop Color="#00000000" Offset="0"/><GradientStop Color="#EE000000" Offset="1"/></LinearGradientBrush></Border.Background>
+       <StackPanel VerticalAlignment="Bottom" Margin="10,0,10,9">
+        <TextBlock Text="{Binding Name}" Foreground="White" TextWrapping="Wrap" MaxHeight="46" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+        <TextBlock Text="{Binding SizeText}" Foreground="#CCFFFFFF" FontSize="13" Margin="0,3,0,0"/></StackPanel></Border>
+      <ToggleButton Tag="heart" IsChecked="{Binding Fav, Mode=TwoWay}" Style="{StaticResource HeartBtn}" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,12,12,0" ToolTip="Favourite"/>
+      <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,56,12,0" Background="{DynamicResource UiAccent}" CornerRadius="9" Padding="8,2" ToolTip="{Binding UpdText}">
+       <Border.Style><Style TargetType="Border"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding HasUpd}" Value="True"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></Border.Style>
+       <TextBlock Text="UPDATE" FontSize="10.5" FontWeight="Bold" Foreground="{DynamicResource UiAccentFg}"/></Border>
       <ItemsControl ItemsSource="{Binding Badges}" VerticalAlignment="Top" HorizontalAlignment="Left" Margin="8"><ItemsControl.ItemTemplate><DataTemplate>
        <Border Background="{Binding Color}" CornerRadius="9" Padding="8,2" Margin="0,0,0,4" HorizontalAlignment="Left"><TextBlock Text="{Binding Text}" FontSize="10.5" FontWeight="SemiBold" Foreground="White"/></Border>
       </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
      </Grid></DataTemplate></ListBox.ItemTemplate>
-   </ListBox>
+   </ListBox></Grid>
    <Border Grid.Column="1" Background="{DynamicResource UiPanel}" CornerRadius="14,0,0,0" Padding="26,26,26,16">
     <Grid>
      <TextBlock x:Name="empty" Text="Select a game" Foreground="{DynamicResource UiMuted}" FontSize="16" HorizontalAlignment="Center" VerticalAlignment="Center"/>
      <ScrollViewer x:Name="detail" Visibility="Collapsed" VerticalScrollBarVisibility="Auto"><StackPanel>
       <Grid Width="200" Height="300" Margin="0,0,0,16">
-       <Rectangle RadiusX="12" RadiusY="12" Fill="{Binding Accent}"/><TextBlock Text="{Binding Letter}" FontSize="96" FontWeight="Bold" Foreground="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-50,0,0"/><Image Source="{Binding Icon}" Width="64" Height="64" Margin="0,80,0,0"/>
-       <Rectangle RadiusX="12" RadiusY="12" Style="{StaticResource CoverRect}"><Rectangle.Fill><ImageBrush ImageSource="{Binding Cover}" Stretch="UniformToFill"/></Rectangle.Fill></Rectangle>
+       <Rectangle RadiusX="{DynamicResource UiRadD}" RadiusY="{DynamicResource UiRadD}" Fill="{Binding Accent}"/><TextBlock Text="{Binding Letter}" FontSize="96" FontWeight="Bold" Foreground="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-50,0,0"/><Image Source="{Binding Icon}" Width="64" Height="64" Margin="0,80,0,0"/>
+       <Rectangle RadiusX="{DynamicResource UiRadD}" RadiusY="{DynamicResource UiRadD}" Style="{StaticResource CoverRect}"><Rectangle.Fill><ImageBrush ImageSource="{Binding Cover}" Stretch="UniformToFill"/></Rectangle.Fill></Rectangle>
       </Grid>
       <TextBlock Text="{Binding Name}" FontSize="21" FontWeight="SemiBold" TextWrapping="Wrap" HorizontalAlignment="Center" TextAlignment="Center"/>
       <ItemsControl ItemsSource="{Binding Badges}" HorizontalAlignment="Center" Margin="0,8,0,14"><ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal"/></ItemsPanelTemplate></ItemsControl.ItemsPanel><ItemsControl.ItemTemplate><DataTemplate>
@@ -468,11 +615,20 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
       </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
       <TextBlock Text="{Binding Meta}" Foreground="{DynamicResource UiSub}" FontSize="12.5" LineHeight="22" TextWrapping="Wrap" Margin="0,0,0,18"/>
       <Button x:Name="btnPlay" Content="Play" Style="{StaticResource Btn}" Background="{DynamicResource UiAccent}" Foreground="{DynamicResource UiAccentFg}" FontWeight="SemiBold" FontSize="15" Padding="14,12"/>
-      <Button x:Name="btnFolder" Content="Open folder" Style="{StaticResource Btn}"/>
-      <Button x:Name="btnExe" Content="Set .exe" Style="{StaticResource Btn}"/>
-      <Button x:Name="btnFind" Content="Find cover online..." Style="{StaticResource Btn}"/>
-      <Button x:Name="btnCover" Content="Set cover image" Style="{StaticResource Btn}"/>
-      <Button x:Name="btnUn" Content="Uninstall completely" Style="{StaticResource Btn}" Background="#C42B1C"/>
+      <Grid><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions>
+       <Button x:Name="btnFolder" Content="Open folder" Style="{StaticResource Btn}" Margin="0,0,4,0"/>
+       <Button x:Name="btnMore" Grid.Column="1" Content="More..." Style="{StaticResource Btn}" Margin="4,0,0,0"/></Grid>
+      <Popup x:Name="morePop" PlacementTarget="{Binding ElementName=btnMore}" Placement="Top" StaysOpen="False" AllowsTransparency="True" PopupAnimation="Fade">
+       <Border Margin="14" Width="280" Background="{DynamicResource UiPanel2}" BorderBrush="{DynamicResource UiCard}" BorderThickness="1" CornerRadius="12" Padding="12,12,12,4">
+        <Border.Effect><DropShadowEffect BlurRadius="14" ShadowDepth="2" Opacity="0.45"/></Border.Effect>
+        <StackPanel>
+         <Button x:Name="btnSeen" Content="Dismiss update notice" Style="{StaticResource Btn}" Visibility="Collapsed"/>
+         <Button x:Name="btnNotes" Content="Find on Steam" Style="{StaticResource Btn}"/>
+         <Button x:Name="btnExe" Content="Set .exe" Style="{StaticResource Btn}"/>
+         <Button x:Name="btnFind" Content="Find cover online..." Style="{StaticResource Btn}"/>
+         <Button x:Name="btnCover" Content="Set cover image" Style="{StaticResource Btn}"/>
+         <Button x:Name="btnUn" Content="Uninstall completely" Style="{StaticResource Btn}" Background="#C42B1C"/>
+        </StackPanel></Border></Popup>
      </StackPanel></ScrollViewer>
     </Grid>
    </Border>
@@ -485,12 +641,12 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
    </StackPanel></Border>
   <Border x:Name="settings" Grid.RowSpan="3" HorizontalAlignment="Right" Width="360" Visibility="Collapsed" Background="{DynamicResource UiPanel2}" BorderBrush="{DynamicResource UiCard}" BorderThickness="1,0,0,0" Padding="24,20,24,16">
    <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
-    <Grid><TextBlock Text="Customise" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="btnCloseSet" Content="Close" Style="{StaticResource Btn}" HorizontalAlignment="Right" Padding="14,6" Margin="0"/></Grid>
+    <Grid><TextBlock Text="Settings" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="btnCloseSet" Content="Close" Style="{StaticResource Btn}" HorizontalAlignment="Right" Padding="14,6" Margin="0"/></Grid>
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,18,0,0"><StackPanel>
-     <TextBlock Text="THEME" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optTheme" Margin="0,8,0,20"><RadioButton Content="Dark" Tag="Dark" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Midnight" Tag="Midnight" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Slate" Tag="Slate" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Light" Tag="Light" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ACCENT COLOUR" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/>
+     <TextBlock Text="LIBRARY" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><Button x:Name="btnFold" Content="Game folders..." Style="{StaticResource Btn}" Margin="0,8,0,8"/><Button x:Name="btnUpdate" Content="Check for app updates" Style="{StaticResource Btn}" Margin="0,0,0,20"/><TextBlock Text="THEME" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optTheme" Margin="0,8,0,20"><RadioButton Content="Dark" Tag="Dark" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Midnight" Tag="Midnight" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Slate" Tag="Slate" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Light" Tag="Light" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ACCENT COLOUR" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/>
      <WrapPanel x:Name="swatches" Margin="0,8,0,4"/>
      <StackPanel Orientation="Horizontal" Margin="0,0,0,20"><Border Background="{DynamicResource UiCard}" CornerRadius="8" Padding="10,2" Margin="0,0,8,0"><TextBox x:Name="hexBox" Width="96" Background="Transparent" Foreground="{DynamicResource UiText}" CaretBrush="{DynamicResource UiText}" BorderThickness="0" Padding="0,6" FontSize="13"/></Border><Button x:Name="btnHex" Content="Apply" Style="{StaticResource Btn}" Padding="14,7" Margin="0"/></StackPanel>
-     <TextBlock Text="POSTER SIZE" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optSize" Margin="0,8,0,20"><RadioButton Content="Small" Tag="Small" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Medium" Tag="Medium" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Large" Tag="Large" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="BACKGROUND" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optBg" Margin="0,8,0,20"><RadioButton Content="Solid" Tag="Solid" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Glow" Tag="Glow" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ENTRANCE ANIMATIONS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optAnim" Margin="0,8,0,20"><RadioButton Content="On" Tag="On" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Off" Tag="Off" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel>
+     <TextBlock Text="POSTER SIZE" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optSize" Margin="0,8,0,20"><RadioButton Content="Small" Tag="Small" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Medium" Tag="Medium" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Large" Tag="Large" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="BACKGROUND" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optBg" Margin="0,8,0,20"><RadioButton Content="Solid" Tag="Solid" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Glow" Tag="Glow" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="CORNERS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optRound" Margin="0,8,0,20"><RadioButton Content="Sharp" Tag="Sharp" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Soft" Tag="Soft" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Round" Tag="Round" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ANIMATION SPEED" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optAnim" Margin="0,8,0,20"><RadioButton Content="Off" Tag="Off" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Fast" Tag="Fast" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Normal" Tag="Normal" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Relaxed" Tag="Relaxed" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel>
      <Button x:Name="btnReset" Content="Reset to default" Style="{StaticResource Btn}" Margin="0,4,0,0"/>
     </StackPanel></ScrollViewer></Grid></Border>
   <ProgressBar x:Name="busy" Grid.Row="2" Height="3" VerticalAlignment="Top" IsIndeterminate="True" Background="Transparent" BorderThickness="0" Foreground="{DynamicResource UiAccent}" Visibility="Collapsed"/>
@@ -499,7 +655,7 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
 </Window>
 '@) } catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; [void][Windows.MessageBox]::Show("Window XAML failed:`n`n$($e.Message)", 'Repack Shelf', 'OK', 'Error'); exit 1 }
 $w.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'UiWinBg'); $w.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'UiText')
-foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','busy','btnUpdate','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
+foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','busy','btnUpdate','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','sortChips','viewChips','favChip','updChip','genreBtn','genrePop','genreClear','catChips','btnMore','morePop','btnSeen','btnNotes','optRound','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
 $w.Title = if ($AppVersion.StartsWith('__')) { 'Repack Shelf (dev build)' } else { "Repack Shelf v$AppVersion" }
 $script:filter = 'All'; $script:games = @(); $script:byKey = @{}
 
@@ -510,7 +666,7 @@ function Animate-In {
         $c = $list.ItemContainerGenerator.ContainerFromItem($it); if (-not $c) { continue }
         $tt = New-Object Windows.Media.TranslateTransform 0, 26
         $c.RenderTransform = $tt; $c.Opacity = 0
-        $begin = [TimeSpan]::FromMilliseconds([Math]::Min($n * 30, 600)); $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(420))
+        $begin = [TimeSpan]::FromMilliseconds([Math]::Min($n * 30 * $script:animK, 600)); $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(420 * $script:animK))
         $a = New-Object Windows.Media.Animation.DoubleAnimation 0, 1, $dur; $a.BeginTime = $begin
         $b = New-Object Windows.Media.Animation.DoubleAnimation 26, 0, $dur; $b.BeginTime = $begin; $b.EasingFunction = $ease
         $c.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
@@ -518,37 +674,45 @@ function Animate-In {
         $n++
     }
 }
-function Refresh-List {
-    $q = $search.Text.Trim(); $f = $script:filter
+function Refresh-List($keep = $false) {
+    $q = $search.Text.Trim(); $f = $script:filter; $gsel = @($script:genres)
     $v = @($script:games | Where-Object {
-        $t = $_.Tags
-        (($f -eq 'All') -or (($t -split ',') -contains $f)) -and (-not $q -or $_.Name -like "*$q*")
+        $t = $_.Tags; $gg = @("$($_.Genres)" -split ',')
+        (($f -eq 'All') -or (($t -split ',') -contains $f)) -and (-not $q -or $_.Name -like "*$q*" -or $_.Genres -like "*$q*") -and (-not $script:favOnly -or $_.Fav) -and (-not $script:updOnly -or $_.HasUpd) -and (@($gsel | Where-Object { $gg -notcontains $_ }).Count -eq 0)
     })
-    $list.ItemsSource = $v; $count.Text = "$($v.Count) game(s)"; $list.UpdateLayout(); Animate-In
+    $v = @(switch ($script:sort) { 'Size' { $v | Sort-Object { $_.Bytes } -Descending } 'Date' { $v | Sort-Object { $_.DateTicks } -Descending } default { $v | Sort-Object { $_.Name } } })
+    $sel = $list.SelectedItem
+    $list.ItemsSource = $v; $count.Text = "$($v.Count) game(s)"
+    if ($keep -and $sel -and ($v -contains $sel)) { $list.SelectedItem = $sel; return }
+    $list.UpdateLayout(); Animate-In
     if ($v.Count -eq 0) { $empty.Text = if ($script:games.Count -eq 0) { "No repack or OnlineFix games found yet.`nUse Folders to add the folder your games live in." } else { 'Nothing matches this filter' } }
     $detail.Visibility = 'Collapsed'; $empty.Visibility = 'Visible'
 }
 function Scan-And-Show($full = $false) {
     foreach ($p in $script:bg) { try { $p.PS.Stop() } catch {} }; $script:bg = @(); $script:miss = 0; $script:doneMsg = $false
-    if ($full) { $script:ofCache = @{}; $script:datCache = @{}; $script:exeCache = @{} }
+    if ($full) { $script:ofCache = @{}; $script:datCache = @{}; $script:exeCache = @{}; foreach ($k in @($script:cfg.Keys)) { if ($k -like 'gen:*' -and "$($script:cfg[$k])" -eq '-') { $script:cfg.Remove($k) } } }
     $script:fullScan = $full; $script:scanning = $true; $btnScan.IsEnabled = $false; $w.Cursor = 'Wait'
     $sig = { param($l) (@($l | ForEach-Object { "$($_.Key):$($_.Tags):$($_.Name):$($_.Dir)" }) -join '|') }
     $before = & $sig $script:games
     $recs = @(Scan)
     $script:games = @(Build-Games $recs); $script:byKey = @{}
     foreach ($g in $script:games) { $script:byKey[$g.Key] = $g }
-    $script:scanning = $false; $btnScan.IsEnabled = $true; $w.Cursor = $null; $busy.IsIndeterminate = $true; $busy.Visibility = 'Collapsed'
+    Rebuild-Cats; Refresh-UpdChip; $script:scanning = $false; $btnScan.IsEnabled = $true; $w.Cursor = $null; $busy.IsIndeterminate = $true; $busy.Visibility = 'Collapsed'
     if ($full -or $script:games.Count -eq 0 -or $before -ne (& $sig $script:games)) { Refresh-List }
     $cj = @(); $sj = @()
     foreach ($g in $script:games) {
         $c = Cache-Path $g.Key; $none = "$c.none"
-        if (-not $g.Size -or $full) { $sj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir } }
-        if (-not (Test-Path $c) -and -not ((Test-Path $none) -and ((Get-Item $none).LastWriteTime -gt (Get-Date).AddDays(-1)))) {
-            $cj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir; Term = (Get-Term $g.Name); Cache = $c } }
+        if (-not $g.Size -or $g.Bytes -le 0 -or $full) { $sj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir } }
+        $needC = (-not (Test-Path $c)) -and -not ((Test-Path $none) -and ((Get-Item $none).LastWriteTime -gt (Get-Date).AddDays(-1)))
+        $gk = "gen:$($g.Key)"; $needG = (-not $g.Genres) -and ("$($script:cfg[$gk])" -ne '-')
+        if ($needC -or $needG) {
+            $ak = "app:$($g.Key)"; $aid = "$($script:cfg[$ak])"
+            $cj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir; Term = (Get-Term $g.Name); Cache = $c; Id = $(if ($aid -match '^\d+$') { $aid }); SkipCover = (-not $needC); NeedGenres = $needG } }
     }
     if ($cj) { Start-Bg $coverSb $cj }
     if ($sj) { Start-Bg $sizeSb $sj }
-    $status.Text = "Found $($script:games.Count) game(s). $(if ($cj) { 'Fetching cover art in the background...' })"
+    Start-NewsCheck $full
+    $status.Text = "Found $($script:games.Count) game(s). $(if ($cj) { 'Fetching cover art and genres in the background...' })"
     Save-Library
 }
 function Finish-Remove($i, $confirmed) {
@@ -613,9 +777,9 @@ function Install-Update {
 $script:upd = $null
 function Sync-Opts {
     $script:syncing = $true
-    $def = @{ theme = 'Dark'; size = 'Medium'; bg = 'Solid'; anim = 'On' }
-    foreach ($pair in @(@($optTheme, 'theme'), @($optSize, 'size'), @($optBg, 'bg'), @($optAnim, 'anim'))) {
-        $v = "$($script:cfg['ui:' + $pair[1]])"; if (-not $v) { $v = $def[$pair[1]] }
+    $def = @{ theme = 'Dark'; size = 'Medium'; bg = 'Solid'; anim = 'Normal'; round = 'Soft' }
+    foreach ($pair in @(@($optTheme, 'theme'), @($optSize, 'size'), @($optBg, 'bg'), @($optAnim, 'anim'), @($optRound, 'round'))) {
+        $v = "$($script:cfg['ui:' + $pair[1]])"; if (-not $v) { $v = $def[$pair[1]] }; if ($v -eq 'On') { $v = 'Normal' }
         foreach ($rb in $pair[0].Children) { $rb.IsChecked = ($rb.Tag -eq $v) }
     }
     $acc = "$($script:cfg['ui:accent'])"; if (-not $acc) { $acc = '#60CDFF' }
@@ -625,7 +789,7 @@ function Sync-Opts {
 }
 function Opt-Changed($rb) {
     if ($script:syncing) { return }
-    $k = switch ($rb.Parent.Name) { 'optTheme' { 'theme' } 'optSize' { 'size' } 'optBg' { 'bg' } default { 'anim' } }
+    $k = switch ($rb.Parent.Name) { 'optTheme' { 'theme' } 'optSize' { 'size' } 'optBg' { 'bg' } 'optRound' { 'round' } default { 'anim' } }
     $script:cfg["ui:$k"] = $rb.Tag; Save-Cfg; Apply-Theme; Fade $w.Content 0.9 240
     if ($k -eq 'size') { $list.UpdateLayout(); Animate-In }
 }
@@ -643,7 +807,7 @@ foreach ($hex in $Accents) {
     $b.Add_Click({ $script:cfg['ui:accent'] = $args[0].Tag; Save-Cfg; Apply-Theme; Sync-Opts })
     [void]$swatches.Children.Add($b)
 }
-foreach ($p in $optTheme, $optSize, $optBg, $optAnim) { foreach ($rb in $p.Children) { $rb.Add_Checked({ Opt-Changed $args[0] }) } }
+foreach ($p in $optTheme, $optSize, $optBg, $optAnim, $optRound) { foreach ($rb in $p.Children) { $rb.Add_Checked({ Opt-Changed $args[0] }) } }
 $btnCustom.Add_Click({ if ($settings.Visibility -eq 'Visible') { Hide-Settings } else { Show-Settings } })
 $btnCloseSet.Add_Click({ Hide-Settings })
 $btnHex.Add_Click({
@@ -652,7 +816,7 @@ $btnHex.Add_Click({
     $script:cfg['ui:accent'] = $h.ToUpper(); Save-Cfg; Apply-Theme; Sync-Opts
 })
 $btnReset.Add_Click({
-    foreach ($k in 'ui:theme', 'ui:accent', 'ui:size', 'ui:bg', 'ui:anim') { $script:cfg.Remove($k) }
+    foreach ($k in 'ui:theme', 'ui:accent', 'ui:size', 'ui:bg', 'ui:anim', 'ui:round') { $script:cfg.Remove($k) }
     Save-Cfg; Apply-Theme; Sync-Opts; Fade $w.Content 0.9 240
 })
 
@@ -662,14 +826,31 @@ $pump.Add_Tick({
     while ($script:q.TryDequeue([ref]$m)) {
         if ($m.T -eq 'update') { Show-Update $m; continue }
         $g = $script:byKey[$m.K]; if (-not $g) { continue }
-        if ($m.T -eq 'cover') { $g.Cover = Load-Img $m.V } elseif ($m.T -eq 'size') { $g.Size = Fmt $m.V } else { $script:miss++ }
+        if ($m.T -eq 'cover') { $g.Cover = Load-Img $m.V; if ($m.Id) { $script:cfg["app:$($m.K)"] = "$($m.Id)" } }
+        elseif ($m.T -eq 'size') { $g.Bytes = [long]$m.V; $g.Size = Fmt $m.V }
+        elseif ($m.T -eq 'genre') {
+            if ($m.Id) { $script:cfg["app:$($m.K)"] = "$($m.Id)" }
+            if ($null -ne $m.V) { $gv = "$($m.V)"; $script:cfg["gen:$($m.K)"] = $(if ($gv) { $gv } else { '-' }); if ($gv) { $g.Genres = $gv; $script:genDirty = $true } }
+        }
+        elseif ($m.T -eq 'news') {
+            if ($m.Ok) {
+                $script:cfg["newschk:$($m.K)"] = "$([DateTime]::UtcNow.Ticks)"; $script:cfgDirty = $true
+                $script:cfg["nd:$($m.K)"] = "$($m.Date)"; $script:cfg["nt:$($m.K)"] = "$($m.Title)"; $script:cfg["nu:$($m.K)"] = "$($m.Url)"
+                $g.NewsDate = [long]$m.Date; $g.NewsTitle = "$($m.Title)"; $g.NewsUrl = "$($m.Url)"; Set-UpdState $g; $script:updDirty = $true
+            }
+        }
+        else { $script:miss++ }
     }
+    if ($script:updDirty) { $script:updDirty = $false; Refresh-UpdChip; if ($script:updOnly) { Refresh-List $true } }
+    if ($script:genDirty) { $script:genDirty = $false; Rebuild-Cats; if ($script:genres.Count) { Refresh-List $true } }
     $run = @($script:bg | Where-Object { -not $_.H.IsCompleted }).Count -gt 0
     if (-not $script:scanning) { $busy.Visibility = if ($run) { 'Visible' } else { 'Collapsed' } }
     if (-not $run -and $script:bg.Count -gt 0 -and -not $script:doneMsg) {
-        $script:doneMsg = $true; Save-Library
-        $status.Text = if ($script:miss) { "No cover found for $($script:miss) game(s). Select one and use Find cover online." } else { 'All covers loaded.' }
+        $script:doneMsg = $true; $script:cfgDirty = $false; Save-Cfg; Save-Library; if ($script:sort -eq 'Size') { Refresh-List $true }
+        $status.Text = if ($script:miss) { "No cover found for $($script:miss) game(s). Select one and use Find cover online." } else { 'Covers, genres and update info loaded.' }
+        Start-NewsCheck $false
     }
+    elseif (-not $run -and $script:cfgDirty) { $script:cfgDirty = $false; Save-Cfg }
 })
 $pump.Start()
 
@@ -678,12 +859,95 @@ $list.Add_SelectionChanged({
     if (-not $g) { return }
     $detail.DataContext = $g; $empty.Visibility = 'Collapsed'; $detail.Visibility = 'Visible'
     $btnPlay.IsEnabled = [bool]$g.Exe
+    $btnNotes.Content = if ($g.HasUpd -and $g.NewsUrl) { 'Read latest patch notes' } elseif ("$($script:cfg['app:' + $g.Key])" -match '^\d+$') { 'Official patch notes (Steam)' } else { 'Find on Steam' }
+    $btnSeen.Visibility = if ($g.HasUpd) { 'Visible' } else { 'Collapsed' }
     $btnUn.Content = if ($g.UnExe -or $g.KeyPath) { 'Uninstall completely' } else { 'Delete game folder' }
     Anim-Slide $detail 'x' 28 330
 })
 $list.Add_MouseDoubleClick({ Play })
 $search.Add_TextChanged({ $ph.Visibility = if ($search.Text) { 'Collapsed' } else { 'Visible' }; Refresh-List })
 foreach ($rb in $chips.Children) { if ($rb -is [Windows.Controls.RadioButton]) { $rb.Add_Checked({ $script:filter = $args[0].Tag; Refresh-List }) } }
+$script:tplGrid = $list.ItemTemplate; $script:panelGrid = $list.ItemsPanel
+function Set-View($v) {
+    $script:view = $v
+    if ($v -eq 'List') { $list.ItemsPanel = $app.Resources['PanelStack']; $list.ItemTemplate = $app.Resources['TplList'] }
+    else { $list.ItemsPanel = $script:panelGrid; $list.ItemTemplate = $script:tplGrid }
+    $list.UpdateLayout(); Animate-In
+}
+function Init-Toolbar {
+    $s = "$($script:cfg['ui:sort'])"; if (@('Name', 'Size', 'Date') -notcontains $s) { $s = 'Name' }
+    $script:sort = $s
+    $vw = "$($script:cfg['ui:view'])"; if ($vw -ne 'List') { $vw = 'Grid' }
+    $script:syncing = $true
+    foreach ($rb in $sortChips.Children) { $rb.IsChecked = ($rb.Tag -eq $s) }
+    foreach ($rb in $viewChips.Children) { $rb.IsChecked = ($rb.Tag -eq $vw) }
+    $script:syncing = $false
+    if ($vw -eq 'List') { Set-View 'List' }
+}
+function Update-GenreBtn {
+    $n = @($script:genres).Count
+    $genreBtn.Content = if ($n) { "Genre ($n)" } else { 'Genre' }; $genreBtn.IsChecked = ($n -gt 0)
+}
+function Refresh-UpdChip {
+    $n = @($script:games | Where-Object { $_.HasUpd }).Count
+    if ($n -eq 0) { $script:updOnly = $false; $updChip.IsChecked = $false }
+    $updChip.Content = "Updates ($n)"; $updChip.Visibility = if ($n -gt 0) { 'Visible' } else { 'Collapsed' }
+}
+function Rebuild-Cats {
+    $script:syncing = $true
+    $freq = @{}
+    foreach ($g in $script:games) { foreach ($n in @("$($g.Genres)" -split ',')) { if ($n) { $freq[$n] = 1 + [int]$freq[$n] } } }
+    $script:genres = @($script:genres | Where-Object { $freq.ContainsKey($_) })
+    $catChips.Children.Clear()
+    foreach ($n in @($freq.Keys | Sort-Object @{ Expression = { -$freq[$_] } }, @{ Expression = { $_ } })) {
+        $tb = New-Object Windows.Controls.Primitives.ToggleButton
+        $tb.Content = "$n ($($freq[$n]))"; $tb.Tag = $n; $tb.Style = $app.Resources['ToggleChip']; $tb.Margin = [Windows.Thickness]::new(0, 0, 6, 8)
+        $tb.IsChecked = ($script:genres -contains $n)
+        $tb.Add_Click({
+            $t = "$($args[0].Tag)"
+            if ($args[0].IsChecked) { $script:genres = @($script:genres + $t) } else { $script:genres = @($script:genres | Where-Object { $_ -ne $t }) }
+            Update-GenreBtn; Refresh-List
+        })
+        [void]$catChips.Children.Add($tb)
+    }
+    $genreBtn.Visibility = if ($freq.Count -gt 0) { 'Visible' } else { 'Collapsed' }
+    Update-GenreBtn
+    $script:syncing = $false
+}
+foreach ($rb in $sortChips.Children) { $rb.Add_Checked({ if ($script:syncing) { return }; $script:sort = $args[0].Tag; $script:cfg['ui:sort'] = $script:sort; Save-Cfg; Refresh-List }) }
+foreach ($rb in $viewChips.Children) { $rb.Add_Checked({ if ($script:syncing) { return }; $script:cfg['ui:view'] = $args[0].Tag; Save-Cfg; Set-View $args[0].Tag }) }
+$favChip.Add_Click({ $script:favOnly = [bool]$favChip.IsChecked; Refresh-List })
+$updChip.Add_Click({ $script:updOnly = [bool]$updChip.IsChecked; Refresh-List })
+$script:popT = @{ more = (Get-Date).AddMinutes(-1); genre = (Get-Date).AddMinutes(-1) }
+$genrePop.Add_Closed({ $script:popT['genre'] = Get-Date })
+$morePop.Add_Closed({ $script:popT['more'] = Get-Date })
+$genreBtn.Add_Click({ Update-GenreBtn; if (((Get-Date) - $script:popT['genre']).TotalMilliseconds -gt 300) { $genrePop.IsOpen = $true } })
+$btnMore.Add_Click({ if (((Get-Date) - $script:popT['more']).TotalMilliseconds -gt 300) { $morePop.IsOpen = $true } })
+$genreClear.Add_Click({ $script:genres = @(); Rebuild-Cats; Refresh-List })
+foreach ($b in $btnNotes, $btnExe, $btnFind, $btnCover, $btnUn, $btnSeen) { $b.Add_Click({ $morePop.IsOpen = $false }) }
+$btnSeen.Add_Click({
+    $g = $list.SelectedItem; if (-not $g) { return }
+    $script:cfg["seen:$($g.Key)"] = "$($g.NewsDate)"; Save-Cfg; Set-UpdState $g
+    $btnSeen.Visibility = 'Collapsed'; $btnNotes.Content = 'Official patch notes (Steam)'; Refresh-UpdChip
+    if ($script:updOnly) { Refresh-List $true }
+})
+function Save-Fav($g) {
+    if (-not $g) { return }
+    $k = "fav:$($g.Key)"; if ($g.Fav) { $script:cfg[$k] = $true } else { $script:cfg.Remove($k) }
+    Save-Cfg
+    if ($script:favOnly) { Refresh-List $true }
+}
+$list.AddHandler([Windows.Controls.Primitives.ButtonBase]::ClickEvent, [Windows.RoutedEventHandler]{
+    $b = $args[1].OriginalSource
+    if ($b -is [Windows.Controls.Primitives.ToggleButton] -and "$($b.Tag)" -eq 'heart') { $args[1].Handled = $true; Save-Fav $b.DataContext }
+})
+$btnNotes.Add_Click({
+    $g = $list.SelectedItem; if (-not $g) { return }
+    if ($g.HasUpd -and $g.NewsUrl) { Start-Process $g.NewsUrl; return }
+    $k = "app:$($g.Key)"; $id = "$($script:cfg[$k])"
+    $url = if ($id -match '^\d+$') { "https://store.steampowered.com/news/app/$id" } else { 'https://store.steampowered.com/search/?term=' + [uri]::EscapeDataString((Get-Term $g.Name)) }
+    Start-Process $url
+})
 $btnScan.ToolTip = 'Click: quick refresh. Shift+click: full rescan.'
 $btnScan.Add_Click({ Scan-And-Show (([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift) -ne 0) })
 $btnUpdate.Add_Click({ Check-Update $true })
@@ -740,7 +1004,9 @@ $btnUn.Add_Click({
 $w.Add_SourceInitialized({ Set-TitleBar })
 $w.Add_ContentRendered({ if (-not $script:started) { $script:started = $true
     $n = 0; foreach ($c in $w.Content.Children[0].Children) { Anim-Slide $c 'y' -14 420 ($n * 70); $n++ }
+    Init-Toolbar
     Load-Library
+    Rebuild-Cats; Refresh-UpdChip
     if ($script:games.Count) { Refresh-List; $status.Text = "Loaded $($script:games.Count) game(s). Checking for changes..."; $w.Dispatcher.Invoke([action]{}, 'Render') }
     Scan-And-Show; Check-Update $false } })
 [void]$w.ShowDialog()
