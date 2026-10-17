@@ -1,0 +1,19 @@
+name: Build check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build exe
+        shell: powershell
+        run: ./build/Build-Exe.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RepackShelf-dev
+          path: dist/RepackShelf.exe
