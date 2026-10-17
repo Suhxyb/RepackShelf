@@ -306,7 +306,8 @@ $Themes = @{
 }
 $Accents = '#60CDFF', '#7C83FF', '#C77DFF', '#FF6B9D', '#FF8A4C', '#FFC83D', '#3DDC97', '#2DD4BF'
 $script:animOn = $true; $script:syncing = $false
-function New-Brush($hex) { $b = New-Object Windows.Media.SolidColorBrush ([Windows.Media.ColorConverter]::ConvertFromString($hex)); $b.Freeze(); $b }
+function New-Brush($hex) { $c = [Windows.Media.Color][Windows.Media.ColorConverter]::ConvertFromString($hex); $b = [Windows.Media.SolidColorBrush]::new($c); $b.Freeze(); $b }
+function Set-Res($k, $v) { $o = $v; if ($o -is [psobject] -and $o.psobject.BaseObject) { $o = $o.psobject.BaseObject }; $script:app.Resources.set_Item([string]$k, [object]$o) }
 function Mix($a, $b, $f) {
     $x = [Windows.Media.ColorConverter]::ConvertFromString($a); $y = [Windows.Media.ColorConverter]::ConvertFromString($b)
     [Windows.Media.Color]::FromRgb([byte][Math]::Round($x.R + ($y.R - $x.R) * $f), [byte][Math]::Round($x.G + ($y.G - $x.G) * $f), [byte][Math]::Round($x.B + ($y.B - $x.B) * $f))
@@ -324,19 +325,19 @@ function Apply-Theme {
     $t = $Themes[$tn]
     $acc = "$($script:cfg['ui:accent'])"; if ($acc -notmatch '^#[0-9A-Fa-f]{6}$') { $acc = '#60CDFF' }
     $r = $app.Resources
-    foreach ($k in 'Text', 'Sub', 'Muted', 'ChipText', 'Thumb', 'Card', 'Btn', 'Hover', 'Panel', 'Panel2') { $r["Ui$k"] = New-Brush $t[$k] }
-    $r['UiAccent'] = New-Brush $acc
+    foreach ($k in 'Text', 'Sub', 'Muted', 'ChipText', 'Thumb', 'Card', 'Btn', 'Hover', 'Panel', 'Panel2') { Set-Res "Ui$k" (New-Brush $t[$k]) }
+    Set-Res 'UiAccent' (New-Brush $acc)
     $c = [Windows.Media.ColorConverter]::ConvertFromString($acc)
-    $r['UiAccentFg'] = New-Brush $(if ((0.299 * $c.R + 0.587 * $c.G + 0.114 * $c.B) -gt 150) { '#101010' } else { '#FFFFFF' })
+    Set-Res 'UiAccentFg' (New-Brush $(if ((0.299 * $c.R + 0.587 * $c.G + 0.114 * $c.B) -gt 150) { '#101010' } else { '#FFFFFF' }))
     if ("$($script:cfg['ui:bg'])" -eq 'Glow') {
-        $gb = New-Object Windows.Media.LinearGradientBrush; $gb.StartPoint = '0,0'; $gb.EndPoint = '1,1'
+        $gb = [Windows.Media.LinearGradientBrush]::new(); $gb.StartPoint = '0,0'; $gb.EndPoint = '1,1'
         $f = if ($t.IsDark) { 0.22 } else { 0.14 }
         [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop (Mix $t.Bg $acc $f), 0.0))
         [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($t.Bg)), 0.62))
-        $gb.Freeze(); $r['UiWinBg'] = $gb
-    } else { $r['UiWinBg'] = New-Brush $t.Bg }
+        $gb.Freeze(); Set-Res 'UiWinBg' $gb
+    } else { Set-Res 'UiWinBg' (New-Brush $t.Bg) }
     $sz = switch ("$($script:cfg['ui:size'])") { 'Small' { 140, 210 } 'Large' { 212, 318 } default { 172, 258 } }
-    $r['UiPW'] = [double]$sz[0]; $r['UiPH'] = [double]$sz[1]
+    Set-Res 'UiPW' ([double]$sz[0]); Set-Res 'UiPH' ([double]$sz[1])
     $script:animOn = "$($script:cfg['ui:anim'])" -ne 'Off'
     $script:themeBg = $t.Bg; $script:themeDark = [bool]$t.IsDark
     Set-TitleBar
@@ -357,7 +358,7 @@ function Fade($el, $from, $ms) {
     $a = New-Object Windows.Media.Animation.DoubleAnimation $from, 1, (New-Object Windows.Duration ([TimeSpan]::FromMilliseconds($ms)))
     $el.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
 }
-$app = New-Object Windows.Application
+$app = [Windows.Application]::Current; if (-not $app) { $app = New-Object Windows.Application }
 $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
  <Style x:Key="Btn" TargetType="Button">
@@ -408,9 +409,9 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
 </ResourceDictionary>
 '@)
 Apply-Theme
-$w = [Windows.Markup.XamlReader]::Parse(@'
+$w = try { [Windows.Markup.XamlReader]::Parse(@'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
- Title="Repack Shelf" Width="1240" Height="780" MinWidth="980" MinHeight="600" Background="{DynamicResource UiWinBg}" Foreground="{DynamicResource UiText}"
+ Title="Repack Shelf" Width="1240" Height="780" MinWidth="980" MinHeight="600"
  WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable Text, Segoe UI" UseLayoutRounding="True">
  <Window.Triggers><EventTrigger RoutedEvent="Window.Loaded"><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.45"/></Storyboard></BeginStoryboard></EventTrigger></Window.Triggers>
  <Grid>
@@ -496,7 +497,8 @@ $w = [Windows.Markup.XamlReader]::Parse(@'
   <TextBlock x:Name="status" Grid.Row="2" Foreground="{DynamicResource UiMuted}" FontSize="12" Margin="26,6,0,10"/>
  </Grid>
 </Window>
-'@)
+'@) } catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; [void][Windows.MessageBox]::Show("Window XAML failed:`n`n$($e.Message)", 'Repack Shelf', 'OK', 'Error'); exit 1 }
+$w.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'UiWinBg'); $w.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'UiText')
 foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','busy','btnUpdate','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
 $w.Title = if ($AppVersion.StartsWith('__')) { 'Repack Shelf (dev build)' } else { "Repack Shelf v$AppVersion" }
 $script:filter = 'All'; $script:games = @(); $script:byKey = @{}
