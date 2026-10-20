@@ -1,4 +1,29 @@
 ﻿$AppVersion = '__VERSION__'; $RepoSlug = '__REPO__'
+
+# ---------- single instance ----------
+# A named mutex is per-user ("Local\") and is released automatically when the process exits,
+# including after a crash, so a stale lock can't block the next launch.
+$script:mutex = New-Object System.Threading.Mutex($false, 'Local\RepackShelf.SingleInstance')
+$script:ownsMutex = $false
+try { $script:ownsMutex = $script:mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $script:ownsMutex = $true }
+if (-not $script:ownsMutex) {
+    # Already running: bring the existing window to the front instead of opening a second one.
+    Add-Type @"
+using System; using System.Runtime.InteropServices;
+public static class RsFocus {
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string c, string t);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+}
+"@
+    $h = [RsFocus]::FindWindow($null, 'Repack Shelf')
+    if ($h -ne [IntPtr]::Zero) {
+        if ([RsFocus]::IsIconic($h)) { [void][RsFocus]::ShowWindow($h, 9) }
+        [void][RsFocus]::SetForegroundWindow($h)
+    }
+    exit
+}
 Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System.Drawing,System.Windows.Forms
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -427,7 +452,14 @@ function Apply-Theme {
         $f = if ($t.IsDark) { 0.22 } else { 0.14 }
         [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop (Mix $t.Bg $acc $f), 0.0))
         [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($t.Bg)), 0.62))
-        $gb.Freeze(); Set-Res 'UiWinBg' $gb
+        if ("$($script:cfg['ui:anim'])" -ne 'Off') {
+            $sw = New-Object Windows.Media.Animation.DoubleAnimation 0.5, 0.88, (New-Object Windows.Duration ([TimeSpan]::FromSeconds(8)))
+            $sw.AutoReverse = $true; $sw.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
+            $se = New-Object Windows.Media.Animation.SineEase; $se.EasingMode = 'EaseInOut'; $sw.EasingFunction = $se
+            [Windows.Media.Animation.Timeline]::SetDesiredFrameRate($sw, 30)
+            $gb.GradientStops[1].BeginAnimation([Windows.Media.GradientStop]::OffsetProperty, $sw)
+        } else { $gb.Freeze() }
+        Set-Res 'UiWinBg' $gb
     } else { Set-Res 'UiWinBg' (New-Brush $t.Bg) }
     $sz = switch ("$($script:cfg['ui:size'])") { 'Small' { 180, 270 } 'Large' { 270, 405 } default { 224, 336 } }
     Set-Res 'UiPW' ([double]$sz[0]); Set-Res 'UiPH' ([double]$sz[1])
@@ -453,6 +485,15 @@ function Fade($el, $from, $ms) {
     $a = New-Object Windows.Media.Animation.DoubleAnimation $from, 1, (New-Object Windows.Duration ([TimeSpan]::FromMilliseconds($ms * $script:animK)))
     $el.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
 }
+function Stagger-Detail {
+    if (-not $script:animOn) { return }
+    $n = 0
+    foreach ($c in @($detail.Content.Children)) {
+        if ($c -is [Windows.Controls.Primitives.Popup]) { continue }
+        $c.BeginAnimation([Windows.UIElement]::OpacityProperty, $null)
+        Anim-Slide $c 'y' 16 360 (60 + $n * 45); $n++
+    }
+}
 $app = [Windows.Application]::Current; if (-not $app) { $app = New-Object Windows.Application }
 $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
@@ -462,7 +503,10 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="Button">
    <Border x:Name="b" Background="{TemplateBinding Background}" CornerRadius="7" Padding="{TemplateBinding Padding}" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform><ContentPresenter HorizontalAlignment="Center"/></Border>
    <ControlTemplate.Triggers>
-    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="b" Property="Opacity" Value="0.82"/></Trigger>
+    <MultiTrigger><MultiTrigger.Conditions><Condition Property="IsMouseOver" Value="True"/><Condition Property="IsEnabled" Value="True"/></MultiTrigger.Conditions>
+     <MultiTrigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="Opacity" To="0.82" Duration="0:0:0.12"/></Storyboard></BeginStoryboard></MultiTrigger.EnterActions>
+     <MultiTrigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.2" FillBehavior="Stop"/></Storyboard></BeginStoryboard></MultiTrigger.ExitActions>
+    </MultiTrigger>
     <Trigger Property="IsPressed" Value="True">
      <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="0.95" Duration="0:0:0.08"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="0.95" Duration="0:0:0.08"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
      <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.16"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.16"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
@@ -473,8 +517,16 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
  <Style x:Key="Chip" TargetType="RadioButton">
   <Setter Property="Margin" Value="0,0,6,0"/><Setter Property="Cursor" Value="Hand"/>
   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="RadioButton">
-   <Border x:Name="b" Background="{DynamicResource UiCard}" CornerRadius="15" Padding="14,6"><TextBlock x:Name="t" Text="{TemplateBinding Content}" FontSize="12.5" Foreground="{DynamicResource UiChipText}"/></Border>
-   <ControlTemplate.Triggers><Trigger Property="IsChecked" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource UiAccent}"/><Setter TargetName="t" Property="Foreground" Value="{DynamicResource UiAccentFg}"/></Trigger></ControlTemplate.Triggers>
+   <Border x:Name="b" Background="{DynamicResource UiCard}" CornerRadius="15" Padding="14,6" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform><TextBlock x:Name="t" Text="{TemplateBinding Content}" FontSize="12.5" Foreground="{DynamicResource UiChipText}"/></Border>
+   <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+     <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.06" Duration="0:0:0.12"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.06" Duration="0:0:0.12"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
+     <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.16"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.16"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
+    </Trigger>
+    <Trigger Property="IsChecked" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource UiAccent}"/><Setter TargetName="t" Property="Foreground" Value="{DynamicResource UiAccentFg}"/>
+     <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.14" Duration="0:0:0.1" AutoReverse="True"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.14" Duration="0:0:0.1" AutoReverse="True"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
+    </Trigger>
+   </ControlTemplate.Triggers>
   </ControlTemplate></Setter.Value></Setter>
  </Style>
  <Style TargetType="ListBoxItem">
@@ -501,7 +553,9 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
    <Border x:Name="b" Width="38" Height="38" CornerRadius="19" Background="{TemplateBinding Background}" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform>
     <Path x:Name="h" Width="20" Height="20" Stretch="Uniform" StrokeThickness="1.7" StrokeLineJoin="Round" Stroke="{TemplateBinding Foreground}" Fill="Transparent" Data="M12,21.35 L10.55,20.03 C5.4,15.36 2,12.28 2,8.5 C2,5.42 4.42,3 7.5,3 C9.24,3 10.91,3.81 12,5.09 C13.09,3.81 14.76,3 16.5,3 C19.58,3 22,5.42 22,8.5 C22,12.28 18.6,15.36 13.45,20.04 Z"/></Border>
    <ControlTemplate.Triggers>
-    <Trigger Property="IsChecked" Value="True"><Setter TargetName="h" Property="Fill" Value="{DynamicResource UiAccent}"/><Setter TargetName="h" Property="Stroke" Value="{DynamicResource UiAccent}"/></Trigger>
+    <Trigger Property="IsChecked" Value="True"><Setter TargetName="h" Property="Fill" Value="{DynamicResource UiAccent}"/><Setter TargetName="h" Property="Stroke" Value="{DynamicResource UiAccent}"/>
+     <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.45" Duration="0:0:0.13" AutoReverse="True"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.45" Duration="0:0:0.13" AutoReverse="True"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
+    </Trigger>
     <Trigger Property="IsMouseOver" Value="True">
      <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.12" Duration="0:0:0.1"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.12" Duration="0:0:0.1"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
      <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.12"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.12"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
@@ -510,8 +564,16 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
  </Style>
  <Style x:Key="ToggleChip" TargetType="ToggleButton"><Setter Property="Margin" Value="0,0,6,0"/><Setter Property="Cursor" Value="Hand"/>
   <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ToggleButton">
-   <Border x:Name="b" Background="{DynamicResource UiCard}" CornerRadius="15" Padding="14,6"><TextBlock x:Name="t" Text="{TemplateBinding Content}" FontSize="12.5" Foreground="{DynamicResource UiChipText}"/></Border>
-   <ControlTemplate.Triggers><Trigger Property="IsChecked" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource UiAccent}"/><Setter TargetName="t" Property="Foreground" Value="{DynamicResource UiAccentFg}"/></Trigger></ControlTemplate.Triggers>
+   <Border x:Name="b" Background="{DynamicResource UiCard}" CornerRadius="15" Padding="14,6" RenderTransformOrigin="0.5,0.5"><Border.RenderTransform><ScaleTransform/></Border.RenderTransform><TextBlock x:Name="t" Text="{TemplateBinding Content}" FontSize="12.5" Foreground="{DynamicResource UiChipText}"/></Border>
+   <ControlTemplate.Triggers>
+    <Trigger Property="IsMouseOver" Value="True">
+     <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.06" Duration="0:0:0.12"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.06" Duration="0:0:0.12"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
+     <Trigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.16"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.16"/></Storyboard></BeginStoryboard></Trigger.ExitActions>
+    </Trigger>
+    <Trigger Property="IsChecked" Value="True"><Setter TargetName="b" Property="Background" Value="{DynamicResource UiAccent}"/><Setter TargetName="t" Property="Foreground" Value="{DynamicResource UiAccentFg}"/>
+     <Trigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.14" Duration="0:0:0.1" AutoReverse="True"/><DoubleAnimation Storyboard.TargetName="b" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.14" Duration="0:0:0.1" AutoReverse="True"/></Storyboard></BeginStoryboard></Trigger.EnterActions>
+    </Trigger>
+   </ControlTemplate.Triggers>
   </ControlTemplate></Setter.Value></Setter>
  </Style>
  <Style x:Key="CoverRect" TargetType="Rectangle"><Style.Triggers><DataTrigger Binding="{Binding Cover}" Value="{x:Null}"><Setter Property="Opacity" Value="0"/>
@@ -519,7 +581,7 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
  </DataTrigger></Style.Triggers></Style>
  <ItemsPanelTemplate x:Key="PanelStack"><StackPanel/></ItemsPanelTemplate>
  <DataTemplate x:Key="TplList">
-  <Grid Height="100" Margin="6,0">
+  <Grid x:Name="row" Height="100" Margin="6,0"><Grid.RenderTransform><TranslateTransform/></Grid.RenderTransform>
    <Grid.ColumnDefinitions><ColumnDefinition Width="82"/><ColumnDefinition Width="*"/><ColumnDefinition Width="130"/><ColumnDefinition Width="150"/><ColumnDefinition Width="54"/></Grid.ColumnDefinitions>
    <Grid Width="62" Height="88" HorizontalAlignment="Left">
     <Rectangle RadiusX="8" RadiusY="8" Fill="{Binding Accent}"/>
@@ -531,6 +593,10 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
    <TextBlock Grid.Column="3" Text="{Binding Date}" VerticalAlignment="Center" Foreground="{DynamicResource UiSub}" FontSize="16"/>
    <ToggleButton Grid.Column="4" Tag="heart" IsChecked="{Binding Fav, Mode=TwoWay}" Style="{StaticResource HeartBtn}" Background="{DynamicResource UiCard}" Foreground="{DynamicResource UiSub}" VerticalAlignment="Center" HorizontalAlignment="Center" ToolTip="Favourite"/>
   </Grid>
+ <DataTemplate.Triggers><DataTrigger Binding="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=IsMouseOver}" Value="True">
+   <DataTrigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="row" Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.X)" To="8" Duration="0:0:0.16"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></DataTrigger.EnterActions>
+   <DataTrigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="row" Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.X)" To="0" Duration="0:0:0.22"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></DataTrigger.ExitActions>
+  </DataTrigger></DataTemplate.Triggers>
  </DataTemplate>
 </ResourceDictionary>
 '@)
@@ -539,15 +605,23 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
  Title="Repack Shelf" Width="1240" Height="780" MinWidth="980" MinHeight="600"
  WindowStartupLocation="CenterScreen" FontFamily="Segoe UI Variable Text, Segoe UI" UseLayoutRounding="True">
- <Window.Triggers><EventTrigger RoutedEvent="Window.Loaded"><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.45"/></Storyboard></BeginStoryboard></EventTrigger></Window.Triggers>
- <Grid>
+ <Window.Triggers><EventTrigger RoutedEvent="Window.Loaded"><BeginStoryboard><Storyboard>
+  <DoubleAnimation Storyboard.TargetProperty="Opacity" From="0" To="1" Duration="0:0:0.45"/>
+  <DoubleAnimation Storyboard.TargetName="root" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" From="0.97" To="1" Duration="0:0:0.6"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation><DoubleAnimation Storyboard.TargetName="root" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" From="0.97" To="1" Duration="0:0:0.6"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation>
+ </Storyboard></BeginStoryboard></EventTrigger></Window.Triggers>
+ <Grid x:Name="root" RenderTransformOrigin="0.5,0.5"><Grid.RenderTransform><ScaleTransform/></Grid.RenderTransform>
   <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
   <Grid Margin="24,18,24,8">
    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="300"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
    <TextBlock Text="Repack Shelf" FontSize="25" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,24,0"/>
    <Border Grid.Column="1" Background="{DynamicResource UiCard}" CornerRadius="9" Padding="12,2">
     <Grid><TextBox x:Name="search" Background="Transparent" Foreground="{DynamicResource UiText}" CaretBrush="{DynamicResource UiText}" BorderThickness="0" FontSize="14" Padding="0,7"/>
-     <TextBlock x:Name="ph" Text="Search games" Foreground="{DynamicResource UiMuted}" FontSize="14" IsHitTestVisible="False" VerticalAlignment="Center"/></Grid></Border>
+     <TextBlock x:Name="ph" Text="Search games" Foreground="{DynamicResource UiMuted}" FontSize="14" IsHitTestVisible="False" VerticalAlignment="Center"/>
+     <Border IsHitTestVisible="False" Margin="-12,-2" BorderThickness="1.5" CornerRadius="9" BorderBrush="{DynamicResource UiAccent}" Opacity="0"><Border.Style><Style TargetType="Border"><Style.Triggers>
+      <DataTrigger Binding="{Binding IsKeyboardFocused, ElementName=search}" Value="True">
+       <DataTrigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" To="1" Duration="0:0:0.18"/></Storyboard></BeginStoryboard></DataTrigger.EnterActions>
+       <DataTrigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetProperty="Opacity" To="0" Duration="0:0:0.25"/></Storyboard></BeginStoryboard></DataTrigger.ExitActions>
+      </DataTrigger></Style.Triggers></Style></Border.Style></Border></Grid></Border>
    <StackPanel x:Name="chips" Grid.Column="2" Orientation="Horizontal" Margin="18,0,0,0" VerticalAlignment="Center">
     <RadioButton Content="All" Tag="All" IsChecked="True" Style="{StaticResource Chip}" GroupName="f"/>
     <RadioButton Content="FitGirl" Tag="FitGirl" Style="{StaticResource Chip}" GroupName="f"/>
@@ -582,7 +656,7 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
     <ListBox Grid.Row="1" x:Name="list" Foreground="{DynamicResource UiText}" Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" Margin="0,0,6,0">
     <ListBox.ItemsPanel><ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate></ListBox.ItemsPanel>
     <ListBox.ItemTemplate><DataTemplate>
-     <Grid Width="{DynamicResource UiPW}" Height="{DynamicResource UiPH}">
+     <Grid x:Name="card" Width="{DynamicResource UiPW}" Height="{DynamicResource UiPH}" RenderTransformOrigin="0.5,0.5"><Grid.RenderTransform><ScaleTransform/></Grid.RenderTransform>
       <Rectangle RadiusX="{DynamicResource UiRad}" RadiusY="{DynamicResource UiRad}" Fill="{Binding Accent}"/>
       <TextBlock Text="{Binding Letter}" FontSize="96" FontWeight="Bold" Foreground="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-40,0,0"/>
       <Image Source="{Binding Icon}" Width="56" Height="56" Margin="0,70,0,0" Opacity="0.9"/>
@@ -592,14 +666,22 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
        <StackPanel VerticalAlignment="Bottom" Margin="10,0,10,9">
         <TextBlock Text="{Binding Name}" Foreground="White" TextWrapping="Wrap" MaxHeight="46" FontSize="15" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
         <TextBlock Text="{Binding SizeText}" Foreground="#CCFFFFFF" FontSize="13" Margin="0,3,0,0"/></StackPanel></Border>
+      <Grid ClipToBounds="True" IsHitTestVisible="False"><Rectangle x:Name="shine" Width="90" HorizontalAlignment="Left"><Rectangle.RenderTransform><TranslateTransform X="-120"/></Rectangle.RenderTransform><Rectangle.Fill><LinearGradientBrush StartPoint="0,0" EndPoint="1,0.12"><GradientStop Color="#00FFFFFF" Offset="0"/><GradientStop Color="#40FFFFFF" Offset="0.5"/><GradientStop Color="#00FFFFFF" Offset="1"/></LinearGradientBrush></Rectangle.Fill></Rectangle></Grid>
       <ToggleButton Tag="heart" IsChecked="{Binding Fav, Mode=TwoWay}" Style="{StaticResource HeartBtn}" HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,12,12,0" ToolTip="Favourite"/>
       <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,56,12,0" Background="{DynamicResource UiAccent}" CornerRadius="9" Padding="8,2" ToolTip="{Binding UpdText}">
-       <Border.Style><Style TargetType="Border"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding HasUpd}" Value="True"><Setter Property="Visibility" Value="Visible"/></DataTrigger></Style.Triggers></Style></Border.Style>
+       <Border.Style><Style TargetType="Border"><Setter Property="Visibility" Value="Collapsed"/><Style.Triggers><DataTrigger Binding="{Binding HasUpd}" Value="True"><Setter Property="Visibility" Value="Visible"/>
+        <DataTrigger.EnterActions><BeginStoryboard x:Name="pulse"><Storyboard Timeline.DesiredFrameRate="30"><DoubleAnimation Storyboard.TargetProperty="Opacity" From="1" To="0.55" Duration="0:0:0.9" AutoReverse="True" RepeatBehavior="Forever"/></Storyboard></BeginStoryboard></DataTrigger.EnterActions>
+        <DataTrigger.ExitActions><RemoveStoryboard BeginStoryboardName="pulse"/></DataTrigger.ExitActions>
+       </DataTrigger></Style.Triggers></Style></Border.Style>
        <TextBlock Text="UPDATE" FontSize="10.5" FontWeight="Bold" Foreground="{DynamicResource UiAccentFg}"/></Border>
       <ItemsControl ItemsSource="{Binding Badges}" VerticalAlignment="Top" HorizontalAlignment="Left" Margin="8"><ItemsControl.ItemTemplate><DataTemplate>
        <Border Background="{Binding Color}" CornerRadius="9" Padding="8,2" Margin="0,0,0,4" HorizontalAlignment="Left"><TextBlock Text="{Binding Text}" FontSize="10.5" FontWeight="SemiBold" Foreground="White"/></Border>
       </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
-     </Grid></DataTemplate></ListBox.ItemTemplate>
+     </Grid>
+     <DataTemplate.Triggers><DataTrigger Binding="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=IsMouseOver}" Value="True">
+      <DataTrigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="card" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.04" Duration="0:0:0.2"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation><DoubleAnimation Storyboard.TargetName="card" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.04" Duration="0:0:0.2"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation><DoubleAnimation Storyboard.TargetName="shine" Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.X)" From="-120" To="340" Duration="0:0:0.75"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></DataTrigger.EnterActions>
+      <DataTrigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="card" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.24"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation><DoubleAnimation Storyboard.TargetName="card" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.24"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></DataTrigger.ExitActions>
+     </DataTrigger></DataTemplate.Triggers></DataTemplate></ListBox.ItemTemplate>
    </ListBox></Grid>
    <Border Grid.Column="1" Background="{DynamicResource UiPanel}" CornerRadius="14,0,0,0" Padding="26,26,26,16">
     <Grid>
@@ -661,16 +743,26 @@ $script:filter = 'All'; $script:games = @(); $script:byKey = @{}
 
 function Animate-In {
     if (-not $script:animOn) { return }
-    $n = 0; $ease = New-Object Windows.Media.Animation.CubicEase; $ease.EasingMode = 'EaseOut'
+    $n = 0
+    $ease = New-Object Windows.Media.Animation.CubicEase; $ease.EasingMode = 'EaseOut'
+    $pop = New-Object Windows.Media.Animation.BackEase; $pop.EasingMode = 'EaseOut'; $pop.Amplitude = 0.45
+    $s0 = if ($script:view -eq 'List') { 0.97 } else { 0.9 }
     foreach ($it in $list.Items) {
         $c = $list.ItemContainerGenerator.ContainerFromItem($it); if (-not $c) { continue }
-        $tt = New-Object Windows.Media.TranslateTransform 0, 26
-        $c.RenderTransform = $tt; $c.Opacity = 0
-        $begin = [TimeSpan]::FromMilliseconds([Math]::Min($n * 30 * $script:animK, 600)); $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(420 * $script:animK))
-        $a = New-Object Windows.Media.Animation.DoubleAnimation 0, 1, $dur; $a.BeginTime = $begin
-        $b = New-Object Windows.Media.Animation.DoubleAnimation 26, 0, $dur; $b.BeginTime = $begin; $b.EasingFunction = $ease
+        $st = New-Object Windows.Media.ScaleTransform $s0, $s0
+        $tt = New-Object Windows.Media.TranslateTransform 0, 30
+        $tg = New-Object Windows.Media.TransformGroup; [void]$tg.Children.Add($st); [void]$tg.Children.Add($tt)
+        $c.RenderTransformOrigin = [Windows.Point]::new(0.5, 0.5); $c.RenderTransform = $tg; $c.Opacity = 0
+        $begin = [TimeSpan]::FromMilliseconds([Math]::Min($n * 28 * $script:animK, 650))
+        $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(520 * $script:animK))
+        $durF = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(380 * $script:animK))
+        $a = New-Object Windows.Media.Animation.DoubleAnimation 0, 1, $durF; $a.BeginTime = $begin
+        $b = New-Object Windows.Media.Animation.DoubleAnimation 30, 0, $dur; $b.BeginTime = $begin; $b.EasingFunction = $ease
+        $s = New-Object Windows.Media.Animation.DoubleAnimation $s0, 1, $dur; $s.BeginTime = $begin; $s.EasingFunction = $pop
         $c.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
         $tt.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $b)
+        $st.BeginAnimation([Windows.Media.ScaleTransform]::ScaleXProperty, $s)
+        $st.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, $s)
         $n++
     }
 }
@@ -862,7 +954,7 @@ $list.Add_SelectionChanged({
     $btnNotes.Content = if ($g.HasUpd -and $g.NewsUrl) { 'Read latest patch notes' } elseif ("$($script:cfg['app:' + $g.Key])" -match '^\d+$') { 'Official patch notes (Steam)' } else { 'Find on Steam' }
     $btnSeen.Visibility = if ($g.HasUpd) { 'Visible' } else { 'Collapsed' }
     $btnUn.Content = if ($g.UnExe -or $g.KeyPath) { 'Uninstall completely' } else { 'Delete game folder' }
-    Anim-Slide $detail 'x' 28 330
+    Anim-Slide $detail 'x' 28 330; Stagger-Detail
 })
 $list.Add_MouseDoubleClick({ Play })
 $search.Add_TextChanged({ $ph.Visibility = if ($search.Text) { 'Collapsed' } else { 'Visible' }; Refresh-List })
@@ -1001,6 +1093,43 @@ $btnUn.Add_Click({
     } elseif (Ask "$($i.Name) has no uninstaller.`n`nPermanently delete its folder ($(Fmt (Get-DirSize $i.Dir)))?`n$($i.Dir)") { Finish-Remove $i $true }
 })
 
+# ---------- smooth wheel scrolling ----------
+function Find-ScrollViewer($el) {
+    if ($el -is [Windows.Controls.ScrollViewer]) { return $el }
+    for ($i = 0; $i -lt [Windows.Media.VisualTreeHelper]::GetChildrenCount($el); $i++) {
+        $r = Find-ScrollViewer ([Windows.Media.VisualTreeHelper]::GetChild($el, $i)); if ($r) { return $r }
+    }
+    $null
+}
+$script:scrollT = 0.0; $script:scrollC = 0.0; $script:scrollSV = $null
+$script:scrollTimer = New-Object Windows.Threading.DispatcherTimer; $script:scrollTimer.Interval = [TimeSpan]::FromMilliseconds(15)
+$script:scrollTimer.Add_Tick({
+    $sv = $script:scrollSV; if (-not $sv) { $args[0].Stop(); return }
+    $script:scrollT = [Math]::Max(0, [Math]::Min($sv.ScrollableHeight, $script:scrollT))
+    $d = $script:scrollT - $script:scrollC
+    if ([Math]::Abs($d) -lt 0.5) { $script:scrollC = $script:scrollT; $args[0].Stop() }
+    else { $script:scrollC += $d * [Math]::Min(0.5, 0.18 / $script:animK) }
+    $sv.ScrollToVerticalOffset($script:scrollC)
+})
+$list.Add_PreviewMouseWheel({
+    if (-not $script:animOn) { return }
+    $sv = Find-ScrollViewer $list; if (-not $sv -or $sv.ScrollableHeight -le 0) { return }
+    if (-not $script:scrollTimer.IsEnabled) { $script:scrollC = $sv.VerticalOffset; $script:scrollT = $sv.VerticalOffset }
+    $script:scrollSV = $sv
+    $script:scrollT = [Math]::Max(0, [Math]::Min($sv.ScrollableHeight, $script:scrollT - $args[1].Delta * 0.9))
+    $args[1].Handled = $true; $script:scrollTimer.Start()
+})
+
+# ---------- fade out on close ----------
+$script:closing = $false
+$w.Add_Closing({
+    if ($script:closing -or -not $script:animOn) { return }
+    $args[1].Cancel = $true; $script:closing = $true
+    $fa = New-Object Windows.Media.Animation.DoubleAnimation 1, 0, (New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(180)))
+    $fa.Add_Completed({ $w.Close() })
+    $w.BeginAnimation([Windows.UIElement]::OpacityProperty, $fa)
+})
+
 $w.Add_SourceInitialized({ Set-TitleBar })
 $w.Add_ContentRendered({ if (-not $script:started) { $script:started = $true
     $n = 0; foreach ($c in $w.Content.Children[0].Children) { Anim-Slide $c 'y' -14 420 ($n * 70); $n++ }
@@ -1010,3 +1139,4 @@ $w.Add_ContentRendered({ if (-not $script:started) { $script:started = $true
     if ($script:games.Count) { Refresh-List; $status.Text = "Loaded $($script:games.Count) game(s). Checking for changes..."; $w.Dispatcher.Invoke([action]{}, 'Render') }
     Scan-And-Show; Check-Update $false } })
 [void]$w.ShowDialog()
+try { $script:mutex.ReleaseMutex() } catch {}
