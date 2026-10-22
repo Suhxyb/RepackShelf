@@ -53,10 +53,21 @@ public class RsGame : INotifyPropertyChanged {
 # ---------- config ----------
 $appDir = Join-Path $env:APPDATA 'RepackShelf'; $coverDir = Join-Path $appDir 'covers'
 New-Item -ItemType Directory -Force $coverDir | Out-Null
+$logDir = Join-Path $appDir 'logs'
+function Write-Log($msg) {
+    try {
+        New-Item -ItemType Directory -Force $logDir | Out-Null
+        $lf = Join-Path $logDir 'repackshelf.log'
+        if ((Test-Path -LiteralPath $lf) -and (Get-Item -LiteralPath $lf).Length -gt 512KB) { Move-Item -LiteralPath $lf -Destination "$lf.old" -Force }
+        Add-Content -LiteralPath $lf -Value ('{0:yyyy-MM-dd HH:mm:ss}  {1}' -f (Get-Date), $msg) -Encoding UTF8
+    } catch {}
+}
+# Writes to a temp file first, then swaps it in, so a crash mid-save can't leave a half-written file.
+function Write-Atomic($path, $text) { $tmp = "$path.tmp"; Set-Content -LiteralPath $tmp -Value $text -Encoding UTF8; Move-Item -LiteralPath $tmp -Destination $path -Force }
 $cfgPath = Join-Path $appDir 'config.json'
 $script:cfg = @{}
-if (Test-Path $cfgPath) { try { (Get-Content $cfgPath -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $script:cfg[$_.Name] = $_.Value } } catch {} }
-function Save-Cfg { $script:cfg | ConvertTo-Json | Set-Content $cfgPath }
+if (Test-Path $cfgPath) { try { (Get-Content $cfgPath -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $script:cfg[$_.Name] = $_.Value } } catch { Write-Log "Could not read config.json: $($_.Exception.Message)" } }
+function Save-Cfg { try { Write-Atomic $cfgPath ($script:cfg | ConvertTo-Json) } catch { Write-Log "Save-Cfg failed: $($_.Exception.Message)" } }
 $libPath = Join-Path $appDir 'library.json'
 $script:ofCache = @{}; $script:datCache = @{}; $script:exeCache = @{}; $script:fullScan = $false; $script:scanning = $false; $script:sort = 'Name'; $script:favOnly = $false; $script:updOnly = $false; $script:updDirty = $false; $script:cfgDirty = $false; $script:genres = @(); $script:genDirty = $false; $script:view = 'Grid'; $script:animK = 1.0
 
@@ -102,8 +113,9 @@ function Step($i, $total, $text) {
 function Save-Library {
     try {
         $recs = @($script:games | ForEach-Object { [pscustomobject]@{ Key = $_.Key; KeyPath = $_.KeyPath; Name = $_.Name; Dir = $_.Dir; UnExe = $_.UnExe; Tags = $_.Tags; Exe = $_.Exe; IconSrc = $_.IconSrc; Version = $_.Version; Date = $_.Date; Size = $_.Size; Bytes = $_.Bytes; DateTicks = $_.DateTicks } })
-        [pscustomobject]@{ v = 1; games = $recs; of = $script:ofCache; dat = $script:datCache } | ConvertTo-Json -Depth 4 | Set-Content $libPath -Encoding UTF8
-    } catch {}
+        $json = [pscustomobject]@{ v = 1; games = $recs; of = $script:ofCache; dat = $script:datCache } | ConvertTo-Json -Depth 4
+        Write-Atomic $libPath $json
+    } catch { Write-Log "Save-Library failed: $($_.Exception.Message)" }
 }
 function Load-Library {
     if (-not (Test-Path $libPath)) { return }
@@ -122,7 +134,7 @@ function Load-Library {
         }
         $script:games = $games; $script:byKey = @{}
         foreach ($g in $games) { $script:byKey[$g.Key] = $g }
-    } catch {}
+    } catch { Write-Log "Load-Library failed: $($_.Exception.Message)" }
 }
 function Get-Term($n) {
     $n = $n -replace '\[[^\]]*\]|\([^\)]*\)', ' ' -replace '[\u2122\u00AE\u00A9]', ' ' -replace '(?i)[-_. ]?online-?fix', ' ' -replace '(?i)\b(v|ver|version|build)[\s\.]?\d[\w\.]*.*$', ' ' -replace '(?i)\b(repack|fitgirl|dodi|goty|deluxe|ultimate|complete|definitive)\s*(edition)?\b', ' ' -replace '[_\.]', ' ' -replace '\s+', ' '
@@ -378,12 +390,19 @@ $updSb = {
     } catch { $q.Enqueue([pscustomobject]@{ T = 'update'; Ok = $false; Manual = $job.Manual }) }
 }
 $script:q = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
-$script:bg = @()
+$script:bg = @(); $script:bgLoose = @()
 function Start-Bg($sb, $jobs, $track = $true) {
     $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
     $ps = [powershell]::Create(); $ps.Runspace = $rs
     [void]$ps.AddScript($sb.ToString()).AddArgument($jobs).AddArgument($script:q)
-    if ($track) { $script:bg += [pscustomobject]@{ PS = $ps; H = $ps.BeginInvoke() } } else { [void]$ps.BeginInvoke() }
+    $item = [pscustomobject]@{ PS = $ps; RS = $rs; H = $ps.BeginInvoke() }
+    if ($track) { $script:bg += $item } else { $script:bgLoose += $item }
+}
+function Release-Bg($b) { try { $b.PS.Dispose() } catch {}; try { $b.RS.Dispose() } catch {} }
+# Frees finished runspaces so they don't pile up over a long session.
+function Reap-Bg {
+    $script:bgLoose = @($script:bgLoose | ForEach-Object { if ($_.H.IsCompleted) { Release-Bg $_ } else { $_ } })
+    if ($script:doneMsg -and $script:bg.Count -gt 0 -and -not @($script:bg | Where-Object { -not $_.H.IsCompleted }).Count) { foreach ($b in $script:bg) { Release-Bg $b }; $script:bg = @() }
 }
 
 # ---------- update checker (Steam developer patch notes) ----------
@@ -725,19 +744,23 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
    <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
     <Grid><TextBlock Text="Settings" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="btnCloseSet" Content="Close" Style="{StaticResource Btn}" HorizontalAlignment="Right" Padding="14,6" Margin="0"/></Grid>
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,18,0,0"><StackPanel>
-     <TextBlock Text="LIBRARY" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><Button x:Name="btnFold" Content="Game folders..." Style="{StaticResource Btn}" Margin="0,8,0,8"/><Button x:Name="btnUpdate" Content="Check for app updates" Style="{StaticResource Btn}" Margin="0,0,0,20"/><TextBlock Text="THEME" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optTheme" Margin="0,8,0,20"><RadioButton Content="Dark" Tag="Dark" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Midnight" Tag="Midnight" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Slate" Tag="Slate" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Light" Tag="Light" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ACCENT COLOUR" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/>
+     <TextBlock Text="LIBRARY" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><Button x:Name="btnFold" Content="Game folders..." Style="{StaticResource Btn}" Margin="0,8,0,8"/><Button x:Name="btnStor" Content="Storage dashboard..." Style="{StaticResource Btn}" Margin="0,0,0,8"/><Button x:Name="btnUpdate" Content="Check for app updates" Style="{StaticResource Btn}" Margin="0,0,0,20"/><TextBlock Text="THEME" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optTheme" Margin="0,8,0,20"><RadioButton Content="Dark" Tag="Dark" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Midnight" Tag="Midnight" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Slate" Tag="Slate" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Light" Tag="Light" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ACCENT COLOUR" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/>
      <WrapPanel x:Name="swatches" Margin="0,8,0,4"/>
      <StackPanel Orientation="Horizontal" Margin="0,0,0,20"><Border Background="{DynamicResource UiCard}" CornerRadius="8" Padding="10,2" Margin="0,0,8,0"><TextBox x:Name="hexBox" Width="96" Background="Transparent" Foreground="{DynamicResource UiText}" CaretBrush="{DynamicResource UiText}" BorderThickness="0" Padding="0,6" FontSize="13"/></Border><Button x:Name="btnHex" Content="Apply" Style="{StaticResource Btn}" Padding="14,7" Margin="0"/></StackPanel>
      <TextBlock Text="POSTER SIZE" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optSize" Margin="0,8,0,20"><RadioButton Content="Small" Tag="Small" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Medium" Tag="Medium" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Large" Tag="Large" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="BACKGROUND" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optBg" Margin="0,8,0,20"><RadioButton Content="Solid" Tag="Solid" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Glow" Tag="Glow" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="CORNERS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optRound" Margin="0,8,0,20"><RadioButton Content="Sharp" Tag="Sharp" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Soft" Tag="Soft" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Round" Tag="Round" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ANIMATION SPEED" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optAnim" Margin="0,8,0,20"><RadioButton Content="Off" Tag="Off" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Fast" Tag="Fast" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Normal" Tag="Normal" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Relaxed" Tag="Relaxed" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel>
      <Button x:Name="btnReset" Content="Reset to default" Style="{StaticResource Btn}" Margin="0,4,0,0"/>
     </StackPanel></ScrollViewer></Grid></Border>
+  <Border x:Name="storage" Grid.RowSpan="3" HorizontalAlignment="Right" Width="360" Visibility="Collapsed" Background="{DynamicResource UiPanel2}" BorderBrush="{DynamicResource UiCard}" BorderThickness="1,0,0,0" Padding="24,20,24,16">
+   <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+    <Grid><TextBlock Text="Storage" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="btnCloseStor" Content="Close" Style="{StaticResource Btn}" HorizontalAlignment="Right" Padding="14,6" Margin="0"/></Grid>
+    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,18,0,0"><StackPanel x:Name="storBody"/></ScrollViewer></Grid></Border>
   <ProgressBar x:Name="busy" Grid.Row="2" Height="3" VerticalAlignment="Top" IsIndeterminate="True" Background="Transparent" BorderThickness="0" Foreground="{DynamicResource UiAccent}" Visibility="Collapsed"/>
   <TextBlock x:Name="status" Grid.Row="2" Foreground="{DynamicResource UiMuted}" FontSize="12" Margin="26,6,0,10"/>
  </Grid>
 </Window>
 '@) } catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; [void][Windows.MessageBox]::Show("Window XAML failed:`n`n$($e.Message)", 'Repack Shelf', 'OK', 'Error'); exit 1 }
 $w.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'UiWinBg'); $w.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'UiText')
-foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','busy','btnUpdate','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','sortChips','viewChips','favChip','updChip','genreBtn','genrePop','genreClear','catChips','btnMore','morePop','btnSeen','btnNotes','optRound','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
+foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','busy','btnUpdate','btnStor','storage','storBody','btnCloseStor','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','sortChips','viewChips','favChip','updChip','genreBtn','genrePop','genreClear','catChips','btnMore','morePop','btnSeen','btnNotes','optRound','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
 $w.Title = if ($AppVersion.StartsWith('__')) { 'Repack Shelf (dev build)' } else { "Repack Shelf v$AppVersion" }
 $script:filter = 'All'; $script:games = @(); $script:byKey = @{}
 
@@ -781,7 +804,7 @@ function Refresh-List($keep = $false) {
     $detail.Visibility = 'Collapsed'; $empty.Visibility = 'Visible'
 }
 function Scan-And-Show($full = $false) {
-    foreach ($p in $script:bg) { try { $p.PS.Stop() } catch {} }; $script:bg = @(); $script:miss = 0; $script:doneMsg = $false
+    foreach ($p in $script:bg) { try { $p.PS.Stop() } catch {}; Release-Bg $p }; $script:bg = @(); $script:miss = 0; $script:doneMsg = $false
     if ($full) { $script:ofCache = @{}; $script:datCache = @{}; $script:exeCache = @{}; foreach ($k in @($script:cfg.Keys)) { if ($k -like 'gen:*' -and "$($script:cfg[$k])" -eq '-') { $script:cfg.Remove($k) } } }
     $script:fullScan = $full; $script:scanning = $true; $btnScan.IsEnabled = $false; $w.Cursor = 'Wait'
     $sig = { param($l) (@($l | ForEach-Object { "$($_.Key):$($_.Tags):$($_.Name):$($_.Dir)" }) -join '|') }
@@ -809,7 +832,7 @@ function Scan-And-Show($full = $false) {
 }
 function Finish-Remove($i, $confirmed) {
     if (Test-Path -LiteralPath $i.Dir) {
-        if ($confirmed -or (Ask "Leftover files remain in:`n$($i.Dir)`n`nDelete them?")) {
+        if ($confirmed -or (Ask "Leftover files remain in:`n$($i.Dir)`n`nDelete them? Anything stored there, such as saves or mods, will be lost.")) {
             try { Remove-Item -LiteralPath $i.Dir -Recurse -Force -ErrorAction Stop } catch { Tell "Could not delete everything: $($_.Exception.Message)`n`nTry running Repack Shelf as administrator." }
         }
     }
@@ -840,7 +863,7 @@ function Show-Update($m) {
 function Install-Update {
     $m = $script:upd
     $self = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-    if (-not $m.Url -or $self -notmatch '(?i)\.exe$' -or $self -match '(?i)\\(powershell|pwsh|powershell_ise)\.exe$') { Start-Process $m.Page; return }
+    if (-not $m.Url -or -not $m.Sha -or $self -notmatch '(?i)\.exe$' -or $self -match '(?i)\\(powershell|pwsh|powershell_ise)\.exe$') { Start-Process $m.Page; return }
     $dir = Split-Path $self; $new = Join-Path $dir 'RepackShelf.update.exe'
     try { $t = Join-Path $dir '.rs_write_test'; Set-Content $t 'x' -ErrorAction Stop; Remove-Item $t -ErrorAction SilentlyContinue }
     catch { Tell "Repack Shelf cannot write to its own folder, so it cannot replace itself there.`nOpening the download page instead."; Start-Process $m.Page; return }
@@ -850,13 +873,13 @@ function Install-Update {
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         $wc = New-Object Net.WebClient; $wc.Headers['User-Agent'] = 'RepackShelf'
         $wc.DownloadFile($m.Url, $new)
-        if ($m.Sha) {
-            $want = ($wc.DownloadString($m.Sha).Trim() -split '\s+')[0].ToLower()
-            if ((Get-FileHash $new -Algorithm SHA256).Hash.ToLower() -ne $want) { throw 'Checksum mismatch, the download could not be verified.' }
-        }
+        $want = ($wc.DownloadString($m.Sha).Trim() -split '\s+')[0].ToLower()
+        if ($want -notmatch '^[0-9a-f]{64}$') { throw 'The checksum file is not valid, so the download could not be verified.' }
+        if ((Get-FileHash $new -Algorithm SHA256).Hash.ToLower() -ne $want) { throw 'Checksum mismatch, the download could not be verified.' }
         if ((Get-Item $new).Length -lt 10KB) { throw 'The downloaded file looks too small.' }
     } catch {
         Remove-Item $new -ErrorAction SilentlyContinue
+        Write-Log "Update failed: $($_.Exception.Message)"
         Tell "Update failed: $($_.Exception.Message)"
         $updTitle.Text = 'Update failed'; $updSub.Text = 'Try again later'; $btnUpd.IsEnabled = $true; $btnLater.IsEnabled = $true; return
     }
@@ -894,13 +917,124 @@ function Hide-Settings {
     $b.Add_Completed({ $settings.Visibility = 'Collapsed' })
     $tt.BeginAnimation([Windows.Media.TranslateTransform]::XProperty, $b)
 }
+# ---------- storage dashboard ----------
+$script:storSel = @{}; $script:storFreedTb = $null; $script:storDirty = $false
+function Get-DriveInfo2($root) {
+    try { $di = New-Object IO.DriveInfo $root; if ($di.IsReady -and $di.TotalSize -gt 0) { return [pscustomobject]@{ Total = [long]$di.TotalSize; Free = [long]$di.AvailableFreeSpace } } } catch {}
+    $null
+}
+function Test-LowDisk($info) { [bool]($info -and (($info.Free -lt 15GB) -or (($info.Free / [double]$info.Total) -lt 0.10))) }
+function Get-LowDrives {
+    $out = @()
+    foreach ($r in @($script:games | ForEach-Object { try { [IO.Path]::GetPathRoot($_.Dir).ToUpper() } catch {} } | Where-Object { $_ } | Select-Object -Unique)) {
+        if (Test-LowDisk (Get-DriveInfo2 $r)) { $out += $r }
+    }
+    $out
+}
+function New-StorText($text, $size = 13.5, $muted = $false, $bold = $false) {
+    $t = New-Object Windows.Controls.TextBlock; $t.Text = $text; $t.FontSize = $size; $t.TextTrimming = 'CharacterEllipsis'
+    if ($bold) { $t.FontWeight = 'SemiBold' }
+    if ($muted) { $t.Tag = 'm' }
+    $t.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($muted) { 'UiMuted' } else { 'UiText' }))
+    $t
+}
+function New-StorLabel($text) { $t = New-StorText $text 11.5 $true $true; $t.Margin = [Windows.Thickness]::new(0, 18, 0, 8); $t }
+function New-StorRow($left, $right, $leftBold = $false) {
+    $g = New-Object Windows.Controls.Grid
+    $c0 = New-Object Windows.Controls.ColumnDefinition; $c1 = New-Object Windows.Controls.ColumnDefinition; $c1.Width = [Windows.GridLength]::Auto
+    [void]$g.ColumnDefinitions.Add($c0); [void]$g.ColumnDefinitions.Add($c1)
+    $a = New-StorText $left 13.5 $false $leftBold
+    $b = New-StorText $right 13 $true; $b.Margin = [Windows.Thickness]::new(10, 0, 0, 0)
+    [Windows.Controls.Grid]::SetColumn($b, 1)
+    [void]$g.Children.Add($a); [void]$g.Children.Add($b)
+    $g
+}
+function New-StorCard($child) {
+    $c = New-Object Windows.Controls.Border; $c.CornerRadius = [Windows.CornerRadius]::new(8); $c.Padding = [Windows.Thickness]::new(12, 10, 12, 10); $c.Margin = [Windows.Thickness]::new(0, 0, 0, 8)
+    $c.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'UiCard'); $c.Child = $child; $c
+}
+function New-StorBar($value, $max) {
+    $p = New-Object Windows.Controls.ProgressBar; $p.Height = 6; $p.Minimum = 0; $p.Maximum = [Math]::Max([double]$max, 1); $p.Value = [Math]::Min([double]$value, $p.Maximum)
+    $p.BorderThickness = [Windows.Thickness]::new(0); $p.Margin = [Windows.Thickness]::new(0, 8, 0, 6)
+    $p.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'UiPanel2'); $p.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'UiAccent')
+    $p
+}
+function Set-StorRowState($row, $on) {
+    $row.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, $(if ($on) { 'UiAccent' } else { 'UiCard' }))
+    foreach ($tb in $row.Child.Children) { $tb.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($on) { 'UiAccentFg' } elseif ($tb.Tag -eq 'm') { 'UiMuted' } else { 'UiText' })) }
+}
+function Update-StorFreed {
+    if (-not $script:storFreedTb) { return }
+    $sel = @($script:games | Where-Object { $script:storSel.ContainsKey($_.Key) })
+    $sum = [long](($sel | Measure-Object Bytes -Sum).Sum)
+    $script:storFreedTb.Text = if ($sel.Count) { "Uninstalling the $($sel.Count) selected game(s) would free about $(Fmt $sum)." } else { 'Select games above to see how much space uninstalling them would free.' }
+}
+function Build-Storage {
+    $storBody.Children.Clear()
+    $games = @($script:games)
+    $sized = @($games | Where-Object { $_.Bytes -gt 0 })
+    $pending = $games.Count - $sized.Count
+    $total = [long](($sized | Measure-Object Bytes -Sum).Sum)
+    [void]$storBody.Children.Add((New-StorText (Fmt $total) 30 $false $true))
+    $sub = New-StorText ("across $($games.Count) game(s)" + $(if ($pending) { " - $pending still calculating" } else { '' })) 13 $true; $sub.Margin = [Windows.Thickness]::new(0, 2, 0, 0)
+    [void]$storBody.Children.Add($sub)
+
+    [void]$storBody.Children.Add((New-StorLabel 'BY DRIVE'))
+    $groups = @($sized | Group-Object { try { [IO.Path]::GetPathRoot($_.Dir).ToUpper() } catch { '?' } } | Sort-Object { ($_.Group | Measure-Object Bytes -Sum).Sum } -Descending)
+    if (-not $groups) { [void]$storBody.Children.Add((New-StorText $(if ($pending) { 'Sizes are still being calculated...' } else { 'No games yet.' }) 13 $true)) }
+    foreach ($gr in $groups) {
+        $used = [long](($gr.Group | Measure-Object Bytes -Sum).Sum)
+        $info = Get-DriveInfo2 $gr.Name
+        $st = New-Object Windows.Controls.StackPanel
+        [void]$st.Children.Add((New-StorRow $gr.Name "$($gr.Count) game(s)" $true))
+        if ($info) {
+            [void]$st.Children.Add((New-StorBar $used $info.Total))
+            [void]$st.Children.Add((New-StorText "Games $(Fmt $used) - $(Fmt $info.Free) free of $(Fmt $info.Total)" 12.5 $true))
+            if (Test-LowDisk $info) {
+                $warn = New-Object Windows.Controls.Border; $warn.CornerRadius = [Windows.CornerRadius]::new(6); $warn.Padding = [Windows.Thickness]::new(10, 6, 10, 6); $warn.Margin = [Windows.Thickness]::new(0, 8, 0, 0); $warn.Background = New-Brush '#C42B1C'
+                $wt = New-Object Windows.Controls.TextBlock; $wt.Text = "Low disk space: only $(Fmt $info.Free) free on this drive."; $wt.Foreground = [Windows.Media.Brushes]::White; $wt.FontSize = 12.5; $wt.TextWrapping = 'Wrap'
+                $warn.Child = $wt; [void]$st.Children.Add($warn)
+            }
+        } else { [void]$st.Children.Add((New-StorText "Games $(Fmt $used)" 12.5 $true)) }
+        [void]$storBody.Children.Add((New-StorCard $st))
+    }
+
+    [void]$storBody.Children.Add((New-StorLabel 'LARGEST GAMES - CLICK TO SELECT'))
+    $top = @($sized | Sort-Object Bytes -Descending | Select-Object -First 12)
+    $keep = @{}; foreach ($g in $top) { if ($script:storSel.ContainsKey($g.Key)) { $keep[$g.Key] = 1 } }; $script:storSel = $keep
+    foreach ($g in $top) {
+        $row = New-StorCard (New-StorRow $g.Name (Fmt $g.Bytes)); $row.Tag = $g.Key; $row.Cursor = 'Hand'; $row.Margin = [Windows.Thickness]::new(0, 0, 0, 6)
+        Set-StorRowState $row $script:storSel.ContainsKey($g.Key)
+        $row.Add_MouseLeftButtonUp({
+            $r = $args[0]; $k = [string]$r.Tag
+            if ($script:storSel.ContainsKey($k)) { $script:storSel.Remove($k) } else { $script:storSel[$k] = 1 }
+            Set-StorRowState $r $script:storSel.ContainsKey($k); Update-StorFreed
+        })
+        [void]$storBody.Children.Add($row)
+    }
+    $tb = New-StorText '' 13.5; $tb.TextTrimming = 'None'; $tb.TextWrapping = 'Wrap'; $tb.Margin = [Windows.Thickness]::new(0, 10, 0, 0); $script:storFreedTb = $tb
+    [void]$storBody.Children.Add($tb); Update-StorFreed
+    $note = New-StorText 'Nothing is deleted from here. Use "Uninstall completely" on a game to remove it.' 12 $true; $note.TextTrimming = 'None'; $note.TextWrapping = 'Wrap'; $note.Margin = [Windows.Thickness]::new(0, 6, 0, 0)
+    [void]$storBody.Children.Add($note)
+}
+function Show-Storage { Build-Storage; $storage.Visibility = 'Visible'; Anim-Slide $storage 'x' 380 380 }
+function Hide-Storage {
+    if (-not $script:animOn) { $storage.Visibility = 'Collapsed'; return }
+    $tt = New-Object Windows.Media.TranslateTransform; $storage.RenderTransform = $tt
+    $dur = New-Object Windows.Duration ([TimeSpan]::FromMilliseconds(260)); $ea = New-Object Windows.Media.Animation.CubicEase; $ea.EasingMode = 'EaseIn'
+    $b = New-Object Windows.Media.Animation.DoubleAnimation 0, 380, $dur; $b.EasingFunction = $ea
+    $b.Add_Completed({ $storage.Visibility = 'Collapsed' })
+    $tt.BeginAnimation([Windows.Media.TranslateTransform]::XProperty, $b)
+}
 foreach ($hex in $Accents) {
     $b = New-Object Windows.Controls.Button; $b.Style = $app.Resources['Swatch']; $b.Background = New-Brush $hex; $b.Tag = $hex; $b.ToolTip = $hex
     $b.Add_Click({ $script:cfg['ui:accent'] = $args[0].Tag; Save-Cfg; Apply-Theme; Sync-Opts })
     [void]$swatches.Children.Add($b)
 }
 foreach ($p in $optTheme, $optSize, $optBg, $optAnim, $optRound) { foreach ($rb in $p.Children) { $rb.Add_Checked({ Opt-Changed $args[0] }) } }
-$btnCustom.Add_Click({ if ($settings.Visibility -eq 'Visible') { Hide-Settings } else { Show-Settings } })
+$btnCustom.Add_Click({ if ($storage.Visibility -eq 'Visible') { Hide-Storage; Show-Settings } elseif ($settings.Visibility -eq 'Visible') { Hide-Settings } else { Show-Settings } })
+$btnStor.Add_Click({ Hide-Settings; Show-Storage })
+$btnCloseStor.Add_Click({ Hide-Storage })
 $btnCloseSet.Add_Click({ Hide-Settings })
 $btnHex.Add_Click({
     $h = $hexBox.Text.Trim(); if ($h -notmatch '^#') { $h = "#$h" }
@@ -919,7 +1053,7 @@ $pump.Add_Tick({
         if ($m.T -eq 'update') { Show-Update $m; continue }
         $g = $script:byKey[$m.K]; if (-not $g) { continue }
         if ($m.T -eq 'cover') { $g.Cover = Load-Img $m.V; if ($m.Id) { $script:cfg["app:$($m.K)"] = "$($m.Id)" } }
-        elseif ($m.T -eq 'size') { $g.Bytes = [long]$m.V; $g.Size = Fmt $m.V }
+        elseif ($m.T -eq 'size') { $g.Bytes = [long]$m.V; $g.Size = Fmt $m.V; $script:storDirty = $true }
         elseif ($m.T -eq 'genre') {
             if ($m.Id) { $script:cfg["app:$($m.K)"] = "$($m.Id)" }
             if ($null -ne $m.V) { $gv = "$($m.V)"; $script:cfg["gen:$($m.K)"] = $(if ($gv) { $gv } else { '-' }); if ($gv) { $g.Genres = $gv; $script:genDirty = $true } }
@@ -933,6 +1067,7 @@ $pump.Add_Tick({
         }
         else { $script:miss++ }
     }
+    if ($script:storDirty) { $script:storDirty = $false; if ($storage.Visibility -eq 'Visible') { Build-Storage } }
     if ($script:updDirty) { $script:updDirty = $false; Refresh-UpdChip; if ($script:updOnly) { Refresh-List $true } }
     if ($script:genDirty) { $script:genDirty = $false; Rebuild-Cats; if ($script:genres.Count) { Refresh-List $true } }
     $run = @($script:bg | Where-Object { -not $_.H.IsCompleted }).Count -gt 0
@@ -940,9 +1075,11 @@ $pump.Add_Tick({
     if (-not $run -and $script:bg.Count -gt 0 -and -not $script:doneMsg) {
         $script:doneMsg = $true; $script:cfgDirty = $false; Save-Cfg; Save-Library; if ($script:sort -eq 'Size') { Refresh-List $true }
         $status.Text = if ($script:miss) { "No cover found for $($script:miss) game(s). Select one and use Find cover online." } else { 'Covers, genres and update info loaded.' }
+        $low = @(Get-LowDrives); if ($low) { $status.Text += "  Low disk space on $($low -join ', ')." }
         Start-NewsCheck $false
     }
     elseif (-not $run -and $script:cfgDirty) { $script:cfgDirty = $false; Save-Cfg }
+    Reap-Bg
 })
 $pump.Start()
 
@@ -957,7 +1094,9 @@ $list.Add_SelectionChanged({
     Anim-Slide $detail 'x' 28 330; Stagger-Detail
 })
 $list.Add_MouseDoubleClick({ Play })
-$search.Add_TextChanged({ $ph.Visibility = if ($search.Text) { 'Collapsed' } else { 'Visible' }; Refresh-List })
+$script:searchTimer = New-Object Windows.Threading.DispatcherTimer; $script:searchTimer.Interval = [TimeSpan]::FromMilliseconds(200)
+$script:searchTimer.Add_Tick({ $script:searchTimer.Stop(); Refresh-List $true })
+$search.Add_TextChanged({ $ph.Visibility = if ($search.Text) { 'Collapsed' } else { 'Visible' }; $script:searchTimer.Stop(); $script:searchTimer.Start() })
 foreach ($rb in $chips.Children) { if ($rb -is [Windows.Controls.RadioButton]) { $rb.Add_Checked({ $script:filter = $args[0].Tag; Refresh-List }) } }
 $script:tplGrid = $list.ItemTemplate; $script:panelGrid = $list.ItemsPanel
 function Set-View($v) {
@@ -1090,7 +1229,7 @@ $btnUn.Add_Click({
             elseif (((Get-Date) - $script:unT0).TotalMinutes -gt 30) { $args[0].Stop(); $status.Text = 'Uninstall did not complete.' }
         })
         $t.Start()
-    } elseif (Ask "$($i.Name) has no uninstaller.`n`nPermanently delete its folder ($(Fmt (Get-DirSize $i.Dir)))?`n$($i.Dir)") { Finish-Remove $i $true }
+    } elseif (Ask "$($i.Name) has no uninstaller.`n`nPermanently delete its folder ($(Fmt (Get-DirSize $i.Dir)))?`n$($i.Dir)`n`nAnything stored inside, such as saves or mods, will be lost.") { Finish-Remove $i $true }
 })
 
 # ---------- smooth wheel scrolling ----------
