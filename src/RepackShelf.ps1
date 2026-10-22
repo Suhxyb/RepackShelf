@@ -1,5 +1,8 @@
 ﻿$AppVersion = '__VERSION__'; $RepoSlug = '__REPO__'
 
+# Optional: put your code-signing certificate thumbprint here to make updates require a valid signature from you.
+$script:UpdateSignerThumbprint = ''
+
 # ---------- single instance ----------
 # A named mutex is per-user ("Local\") and is released automatically when the process exits,
 # including after a crash, so a stale lock can't block the next launch.
@@ -32,6 +35,8 @@ public static class Dwm { [DllImport("dwmapi.dll")] public static extern int Dwm
 Add-Type -TypeDefinition @'
 using System.ComponentModel;
 public class RsBadge { public string Text {get;set;} public string Color {get;set;} }
+public class RsSave { public bool Checked {get;set;} public string Location {get;set;} public string Label {get;set;} public string Kind {get;set;} public string Rel {get;set;} public long Bytes {get;set;}
+  public string SizeText { get { return Bytes < 0 ? "over 2 GB" : (Bytes >= 1073741824L ? (Bytes / 1073741824.0).ToString("0.0") + " GB" : (Bytes / 1048576.0).ToString("0") + " MB"); } } }
 public class RsGame : INotifyPropertyChanged {
   public event PropertyChangedEventHandler PropertyChanged;
   void N(string p) { var h = PropertyChanged; if (h != null) h(this, new PropertyChangedEventArgs(p)); }
@@ -73,14 +78,113 @@ $script:ofCache = @{}; $script:datCache = @{}; $script:exeCache = @{}; $script:f
 
 # ---------- helpers ----------
 function Fmt($b) { if ($b -ge 1GB) { '{0:N1} GB' -f ($b / 1GB) } else { '{0:N0} MB' -f ($b / 1MB) } }
-function Get-DirSize($d) { $s = 0L; try { foreach ($f in [IO.Directory]::EnumerateFiles($d, '*', [IO.SearchOption]::AllDirectories)) { try { $s += ([IO.FileInfo]$f).Length } catch {} } } catch {}; $s }
 function Ask($t) { [Windows.MessageBox]::Show($t, 'Repack Shelf', 'YesNo', 'Warning') -eq 'Yes' }
 function Tell($t) { [void][Windows.MessageBox]::Show($t, 'Repack Shelf', 'OK', 'Information') }
+# ---------- safety helpers ----------
+# Only local, fixed-drive paths are trusted (no UNC / network paths, which can leak credentials when touched).
+function Test-LocalPath($p) {
+    if (-not $p -or "$p" -notmatch '^[A-Za-z]:\\') { return $false }
+    if (-not $script:fixedDrives) { $script:fixedDrives = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' } | ForEach-Object { "$($_.Name)".Substring(0, 1).ToUpper() }) }
+    $script:fixedDrives -contains "$p".Substring(0, 1).ToUpper()
+}
+function Test-LocalExe($p) { (Test-LocalPath $p) -and ("$p" -match '(?i)\.exe$') -and (Test-Path -LiteralPath $p -PathType Leaf) }
+# Folders that must never be deleted by the app: system and personal folders, library roots and the app's own folders.
+function Get-ProtectedPaths {
+    $list = @($env:USERPROFILE, $env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:APPDATA, $env:LOCALAPPDATA, $env:PUBLIC,
+              [Environment]::GetFolderPath('MyDocuments'), [Environment]::GetFolderPath('Desktop'),
+              (Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $env:USERPROFILE 'Games'), $appDir)
+    try { $list += (Split-Path ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)) } catch {}
+    foreach ($d in [IO.DriveInfo]::GetDrives()) { foreach ($n in 'Games', 'Game', 'OnlineFix', 'Downloads', 'Users', 'Windows', 'Program Files', 'Program Files (x86)', 'ProgramData') { $list += ($d.Name + $n) } }
+    $list += @($script:cfg['folders'])
+    @($list | Where-Object { $_ } | ForEach-Object { "$_".TrimEnd('\') })
+}
+# A target is refused if it is a drive root, a UNC path, inside Windows, one of the protected folders, or a parent of one.
+function Test-SafeDeleteTarget($dir) {
+    try { $p = [IO.Path]::GetFullPath("$dir").TrimEnd('\') } catch { return $false }
+    if ($p.Length -le 2 -or $p.StartsWith('\\')) { return $false }
+    $win = "$env:WINDIR".TrimEnd('\')
+    if ($win -and ($p -ieq $win -or $p.StartsWith("$win\", [StringComparison]::OrdinalIgnoreCase))) { return $false }
+    foreach ($b in (Get-ProtectedPaths)) {
+        if ($p -ieq $b -or $b.StartsWith("$p\", [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    $true
+}
+# Deletes a game folder without following junctions/symlinks (they are unlinked, never entered) and clears read-only flags first.
+function Remove-GameDir($dir) {
+    if (-not (Test-SafeDeleteTarget $dir)) { throw "Refusing to delete this folder: $dir" }
+    $stack = New-Object 'System.Collections.Generic.Stack[string]'; $stack.Push($dir)
+    while ($stack.Count) {
+        $cur = $stack.Pop()
+        try {
+            foreach ($f in [IO.Directory]::EnumerateFiles($cur)) { try { [IO.File]::SetAttributes($f, [IO.FileAttributes]::Normal) } catch {} }
+            foreach ($x in [IO.Directory]::EnumerateDirectories($cur)) { if (([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push($x) } }
+        } catch {}
+    }
+    [IO.Directory]::Delete($dir, $true)
+}
+function Test-UninstallKey($kp) { "$kp" -match '^Registry::HKEY_(LOCAL_MACHINE|CURRENT_USER)\\SOFTWARE\\(WOW6432Node\\)?Microsoft\\Windows\\CurrentVersion\\Uninstall\\[^\\]+$' }
+# Genuine Inno Setup uninstallers contain the text "Inno Setup"; anything else gets a warning before it is run.
+function Test-InnoUninstaller($path) {
+    try {
+        $fi = Get-Item -LiteralPath $path -ErrorAction Stop
+        if ($fi.Length -gt 12MB) { return $false }
+        [bool]([Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($fi.FullName)) -match 'Inno Setup')
+    } catch { $false }
+}
+# Links are only opened over HTTPS on trusted hosts; anything else falls back to a safe page or is refused.
+$script:SafeHosts = @('steampowered.com', 'steamcommunity.com', 'github.com')
+function Test-SafeUrl($url) {
+    try { $u = [Uri]"$url" } catch { return $false }
+    if (-not $u.IsAbsoluteUri -or $u.Scheme -ne 'https') { return $false }
+    foreach ($h in $script:SafeHosts) { if ($u.Host -eq $h -or $u.Host.EndsWith(".$h")) { return $true } }
+    $false
+}
+function Open-SafeUrl($url, $fallback = $null) {
+    if (Test-SafeUrl $url) { Start-Process "$url"; return }
+    if ($fallback -and (Test-SafeUrl $fallback)) { Start-Process "$fallback"; return }
+    Tell 'That link is not on a trusted host, so it was not opened.'
+}
+# Downloads with a size cap and timeouts, HTTPS only, and checks the final host after redirects.
+function Save-Capped($url, $dest, $max, $hostOk) {
+    if ("$url" -notlike 'https://*') { throw 'Only HTTPS downloads are allowed.' }
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    $req = [Net.HttpWebRequest][Net.WebRequest]::Create($url)
+    $req.UserAgent = 'RepackShelf'; $req.Timeout = 30000; $req.ReadWriteTimeout = 30000; $req.MaximumAutomaticRedirections = 5
+    $resp = $req.GetResponse()
+    try {
+        $rh = $resp.ResponseUri.Host.ToLower(); $ok = $false
+        foreach ($h in $hostOk) { if ($rh -eq $h -or $rh.EndsWith(".$h")) { $ok = $true } }
+        if ($resp.ResponseUri.Scheme -ne 'https' -or -not $ok) { throw "The download was redirected to an unexpected host ($rh)." }
+        if ($resp.ContentLength -gt $max) { throw 'The download is larger than expected.' }
+        $in = $resp.GetResponseStream(); $out = [IO.File]::Create($dest); $n = 0L; $buf = New-Object byte[] 81920
+        try {
+            while (($r = $in.Read($buf, 0, $buf.Length)) -gt 0) { $n += $r; if ($n -gt $max) { throw 'The download is larger than expected.' }; $out.Write($buf, 0, $r) }
+        } finally { $out.Dispose(); $in.Dispose() }
+    } finally { $resp.Close() }
+}
+# Directory walkers that never enter junctions or symlinks.
+function Get-FilesBounded($dir, $pattern, $depth) {
+    try {
+        foreach ($f in [IO.Directory]::EnumerateFiles($dir, $pattern)) { [IO.FileInfo]$f }
+        if ($depth -gt 0) { foreach ($d in [IO.Directory]::EnumerateDirectories($dir)) { if (([IO.File]::GetAttributes($d) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { Get-FilesBounded $d $pattern ($depth - 1) } } }
+    } catch {}
+}
+function Get-DirSize($d) {
+    $s = 0L; $stack = New-Object 'System.Collections.Generic.Stack[string]'; $stack.Push($d)
+    while ($stack.Count) {
+        $cur = $stack.Pop()
+        try {
+            foreach ($f in [IO.Directory]::EnumerateFiles($cur)) { try { $s += ([IO.FileInfo]$f).Length } catch {} }
+            foreach ($x in [IO.Directory]::EnumerateDirectories($cur)) { if (([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push($x) } }
+        } catch {}
+    }
+    $s
+}
 function Cache-Path($key) { Join-Path $coverDir (([BitConverter]::ToString([Security.Cryptography.MD5]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($key))) -replace '-') + '.jpg') }
 function Find-OF($dir, $depth = 3) {
     try {
         if ([IO.Directory]::EnumerateFiles($dir, 'OnlineFix*').GetEnumerator().MoveNext()) { return $true }
-        if ($depth -gt 0) { foreach ($d in [IO.Directory]::EnumerateDirectories($dir)) { if (Find-OF $d ($depth - 1)) { return $true } } }
+        if ($depth -gt 0) { foreach ($d in [IO.Directory]::EnumerateDirectories($dir)) { if (([IO.File]::GetAttributes($d) -band [IO.FileAttributes]::ReparsePoint) -eq 0 -and (Find-OF $d ($depth - 1))) { return $true } } }
     } catch {}
     $false
 }
@@ -125,9 +229,13 @@ function Load-Library {
         if ($d.dat) { foreach ($p in $d.dat.PSObject.Properties) { $script:datCache[$p.Name] = @{ L = "$($p.Value.L)"; V = "$($p.Value.V)" } } }
         $games = @()
         foreach ($r in @($d.games)) {
-            if (-not $r.Dir -or -not (Test-Path -LiteralPath $r.Dir) -or "$($r.Tags)" -eq 'Inno') { continue }
-            $script:exeCache[$r.Key] = $r.Exe
-            $rec = [pscustomobject]@{ Key = $r.Key; KeyPath = $r.KeyPath; Name = $r.Name; Dir = $r.Dir; UnExe = $r.UnExe; Tags = @("$($r.Tags)" -split ','); IconSrc = $r.IconSrc; Version = $r.Version; Date = $r.Date; DateTicks = $r.DateTicks }
+            if (-not $r.Dir -or -not (Test-LocalPath $r.Dir) -or -not (Test-Path -LiteralPath $r.Dir) -or "$($r.Tags)" -eq 'Inno') { continue }
+            # cached values are re-validated, never trusted blindly
+            $kp = if (Test-UninstallKey $r.KeyPath) { $r.KeyPath } else { $null }
+            $ue = if ($r.UnExe -and (Test-LocalPath $r.UnExe)) { $r.UnExe } else { $null }
+            $ic = if ($r.IconSrc -and (Test-LocalPath $r.IconSrc)) { $r.IconSrc } else { $null }
+            $script:exeCache[$r.Key] = $(if ($r.Exe -and (Test-LocalExe $r.Exe)) { $r.Exe } else { $null })
+            $rec = [pscustomobject]@{ Key = $r.Key; KeyPath = $kp; Name = $r.Name; Dir = $r.Dir; UnExe = $ue; Tags = @("$($r.Tags)" -split ','); IconSrc = $ic; Version = $r.Version; Date = $r.Date; DateTicks = $r.DateTicks }
             $g = New-Game $rec
             if ($r.Size) { $g.Size = $r.Size }; $g.Bytes = [long]$r.Bytes
             $games += $g
@@ -143,8 +251,8 @@ function Get-Term($n) {
 function Get-Exe($dir) { try { Get-Exe2 $dir } catch { $null } }
 function Get-Exe2($dir) {
     $bad = '^(unins|UnityCrash|UE4Prereq|vc_?redist|dxsetup|dotnet|CrashReport|oalinst|installer|setup)|redist|crashpad'
-    Get-ChildItem -LiteralPath $dir -Filter *.exe -File -Recurse -Depth 2 -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -notmatch $bad -and $_.DirectoryName -notmatch 'CommonRedist|Redist|Support' } |
+    Get-FilesBounded $dir '*.exe' 2 |
+        Where-Object { $_.Extension -ieq '.exe' -and $_.Name -notmatch $bad -and $_.DirectoryName -notmatch 'CommonRedist|Redist|Support' } |
         Sort-Object Length -Descending | Select-Object -First 1 -ExpandProperty FullName
 }
 function Get-Icon($path) {
@@ -177,11 +285,11 @@ function New-Game($r) {
     $g = New-Object RsGame
     $g.Key = $r.Key; $g.KeyPath = $r.KeyPath; $g.Name = $r.Name; $g.Dir = $r.Dir; $g.UnExe = $r.UnExe; $g.Version = $r.Version; $g.Date = $r.Date; $g.Tags = ($tags -join ',')
     $exe = $script:cfg["exe:$($r.Key)"]
-    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { $exe = $script:exeCache[$r.Key] }
-    if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { $exe = Get-Exe $r.Dir }
+    if (-not $exe -or -not (Test-LocalExe $exe)) { $exe = $script:exeCache[$r.Key] }
+    if (-not $exe -or -not (Test-LocalExe $exe)) { $exe = Get-Exe $r.Dir }
     $script:exeCache[$r.Key] = $exe; $g.Exe = $exe
     $ico = $r.IconSrc
-    if (-not $ico -or $ico -match '[<>|"*?]' -or -not (Test-Path -LiteralPath $ico) -or $ico -match 'unins') { $ico = $exe }
+    if (-not $ico -or $ico -match '[<>|"*?]' -or -not (Test-LocalPath $ico) -or -not (Test-Path -LiteralPath $ico) -or $ico -match 'unins') { $ico = $exe }
     $g.IconSrc = $ico
     $g.DateTicks = [long]$r.DateTicks; $gk = "gen:$($r.Key)"; $gv = "$($script:cfg[$gk])"; if ($gv -and $gv -ne '-') { $g.Genres = $gv }; $nk = $r.Key; $g.NewsDate = [long]("0" + [string]$script:cfg["nd:$nk"]); $g.NewsTitle = [string]$script:cfg["nt:$nk"]; $g.NewsUrl = [string]$script:cfg["nu:$nk"]; Set-UpdState $g; $g.Fav = [bool]$script:cfg["fav:$($r.Key)"]
     if ($ico) { $g.Icon = Get-Icon $ico }
@@ -194,6 +302,7 @@ function New-Game($r) {
     $g
 }
 function Scan {
+    $script:fixedDrives = $null
     $out = @(); $seen = @{}
     $fg = '(?i)fit-?girl'; $dd = '(?i)dodi[- ]?repack|\bdodi\b'
     $srcs = @(
@@ -207,7 +316,7 @@ function Scan {
     $folders = @($script:cfg['folders'])
     foreach ($d in [IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' }) { foreach ($n in 'Games', 'Game', 'OnlineFix', 'Downloads') { $folders += ($d.Name + $n) } }
     $folders += (Join-Path $env:USERPROFILE 'Games'), (Join-Path $env:USERPROFILE 'Downloads')
-    $roots = @($folders | Where-Object { $_ -and ($_ -notmatch '[<>|"*?]') -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)
+    $roots = @($folders | Where-Object { $_ -and ($_ -notmatch '[<>|"*?]') -and (Test-LocalPath $_) -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)
     $kids = @{}; $nk = 0
     foreach ($r in $roots) { $kids[$r] = @(try { [IO.Directory]::EnumerateDirectories($r) } catch { @() }); $nk += $kids[$r].Count }
     $total = $entries.Count + $nk; $i = 0
@@ -222,6 +331,7 @@ function Scan {
             if (-not $p.DisplayName -or -not $p.UninstallString -or $p.SystemComponent -eq '1') { continue }
             $name = $e.Name; $un = $p.UninstallString.Trim()
             $unExe = if ($un -match '(?i)([a-z]:\\[^"<>|*?]*?\.exe)') { $Matches[1] } else { $null }
+            if ($unExe -and -not (Test-LocalPath $unExe)) { $unExe = $null }
             $blob = "$($p.DisplayName) $($p.Publisher) $($p.URLInfoAbout) $($p.URLUpdateInfo) $($p.HelpLink) $($p.Comments) $($p.InstallLocation)"
             $inno = ($name -like '*_is1') -or ($unExe -and $unExe -match 'unins\d{3}\.exe$')
             $tags = @()
@@ -235,26 +345,25 @@ function Scan {
             $dir = $p.InstallLocation.Trim('"', ' ', '\')
             if (-not $dir -and $unExe) { $dir = Split-Path $unExe -Parent }
             if ($dir) { $dir = $dir.Trim() }
-            if (-not $dir -or $dir -match '[<>|"*?]' -or -not (Test-Path -LiteralPath $dir) -or $seen[$dir.ToLower()]) { continue }
+            if (-not $dir -or $dir -match '[<>|"*?]' -or -not (Test-LocalPath $dir) -or -not (Test-Path -LiteralPath $dir) -or $seen[$dir.ToLower()]) { continue }
             if (Find-OFCached $dir) { $tags += 'OnlineFix' }
             $dt = $null
             if ($p.InstallDate -match '^\d{8}$') { try { $dt = [datetime]::ParseExact($p.InstallDate, 'yyyyMMdd', $null) } catch {} }
             if (-not $dt) { try { $dt = (Get-Item -LiteralPath $dir).CreationTime } catch {} }
             $date = if ($dt) { $dt.ToString('d MMM yyyy') } else { $null }; $dticks = if ($dt) { $dt.Ticks } else { 0 }
+            $icoSrc = ($p.DisplayIcon -split ',')[0].Trim('"'); if (-not (Test-LocalPath $icoSrc)) { $icoSrc = $null }
             $seen[$dir.ToLower()] = 1
-            $out += [pscustomobject]@{ Key = $name; KeyPath = "Registry::$($e.HiveName)\$($e.Sub)\$name"; Name = $p.DisplayName; Dir = $dir; UnExe = $unExe; Tags = $tags; IconSrc = ($p.DisplayIcon -split ',')[0].Trim('"'); Version = $p.DisplayVersion; Date = $date; DateTicks = $dticks }
+            $out += [pscustomobject]@{ Key = $name; KeyPath = "Registry::$($e.HiveName)\$($e.Sub)\$name"; Name = $p.DisplayName; Dir = $dir; UnExe = $unExe; Tags = $tags; IconSrc = $icoSrc; Version = $p.DisplayVersion; Date = $date; DateTicks = $dticks }
         } catch { continue }
     }
 
     # folder-based games (OnlineFix releases are usually extracted, not installed)
-    $userRoots = @($script:cfg['folders'])
     foreach ($r in $roots) {
         $hits = @()
         foreach ($c in $kids[$r]) {
             $i++; if ($i % 6 -eq 0) { Step $i $total "Scanning game folders ($i of $total)..." }
             if (Find-OFCached $c) { $hits += $c }
         }
-        if (-not $hits -and ($userRoots -contains $r) -and (Find-OFCached $r)) { $hits = @($r) }
         foreach ($d in $hits) {
             try {
                 $dl = $d.ToLower().TrimEnd('\')
@@ -285,7 +394,24 @@ $coverSb = {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $norm = { param($s) ($s -replace '[^a-zA-Z0-9]', '').ToLower() }
     $junk = '(?i)soundtrack|\bost\b|\bdlc\b|\bdemo\b|bundle|artbook|season pass|playtest|dedicated server|\bbeta\b'
-    $get = { param($url, $out) try { Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 20; if ((Get-Item $out).Length -gt 2000) { $true } else { Remove-Item $out -ErrorAction SilentlyContinue; $false } } catch { Remove-Item $out -ErrorAction SilentlyContinue; $false } }
+    $get = {
+        param($url, $out)
+        try {
+            $u = [Uri]"$url"
+            $hostOk = ($u.Scheme -eq 'https') -and ($u.Host -like '*.steamstatic.com' -or $u.Host -like '*.akamaihd.net' -or $u.Host -like '*.steampowered.com')
+            if (-not $hostOk) { return $false }
+            $req = [Net.HttpWebRequest][Net.WebRequest]::Create($u); $req.Timeout = 20000; $req.ReadWriteTimeout = 20000; $req.UserAgent = 'RepackShelf'
+            $resp = $req.GetResponse()
+            try {
+                if ($resp.ResponseUri.Scheme -ne 'https' -or $resp.ContentLength -gt 6MB) { return $false }
+                $in = $resp.GetResponseStream(); $fs = [IO.File]::Create($out); $n = 0L; $buf = New-Object byte[] 65536
+                try { while (($r = $in.Read($buf, 0, $buf.Length)) -gt 0) { $n += $r; if ($n -gt 6MB) { break }; $fs.Write($buf, 0, $r) } } finally { $fs.Dispose(); $in.Dispose() }
+            } finally { $resp.Close() }
+            $b = [IO.File]::ReadAllBytes($out)
+            $img = ($b.Length -gt 2000 -and $b.Length -le 6MB) -and (($b[0] -eq 0xFF -and $b[1] -eq 0xD8) -or ($b[0] -eq 0x89 -and $b[1] -eq 0x50))
+            if ($img) { $true } else { Remove-Item $out -ErrorAction SilentlyContinue; $false }
+        } catch { Remove-Item $out -ErrorAction SilentlyContinue; $false }
+    }
     $search = {
         param($term, $loose)
         $c = @()
@@ -314,7 +440,7 @@ $coverSb = {
         param($id)
         $ok = $false; $tags = @(); $more = @()
         try {
-            $r = Invoke-WebRequest -Uri "https://store.steampowered.com/app/$id/?l=english" -UseBasicParsing -TimeoutSec 20 -Headers @{ Cookie = 'birthtime=568022401; lastagecheckage=1-0-1988; wants_mature_content=1' }
+            $r = Invoke-WebRequest -Uri "https://store.steampowered.com/app/$id/?l=english" -UseBasicParsing -TimeoutSec 20
             $ok = $true
             foreach ($m in [regex]::Matches($r.Content, '(?s)class="app_tag"[^>]*>\s*([^<]+?)\s*</a>')) { $tags += [Net.WebUtility]::HtmlDecode($m.Groups[1].Value) }
         } catch {}
@@ -339,14 +465,21 @@ $coverSb = {
         }
         ($res -join ',')
     }
+    $walk = {
+        param($dir, $pattern, $depth)
+        try {
+            foreach ($f in [IO.Directory]::EnumerateFiles($dir, $pattern)) { [IO.FileInfo]$f }
+            if ($depth -gt 0) { foreach ($d in [IO.Directory]::EnumerateDirectories($dir)) { if (([IO.File]::GetAttributes($d) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { & $walk $d $pattern ($depth - 1) } } }
+        } catch {}
+    }
     foreach ($j in $jobs) {
         try {
             $id = $null
             if ($j.Id) { $id = $j.Id }
-            if (-not $id) { foreach ($f in @(Get-ChildItem -LiteralPath $j.Dir -Filter 'OnlineFix*.ini' -File -Recurse -Depth 3 -ErrorAction SilentlyContinue)) {
-                if ((Get-Content $f.FullName -Raw) -match '(?im)^\s*RealAppId\s*=\s*(\d+)') { $id = $Matches[1]; break } } }
-            if (-not $id) { foreach ($f in @(Get-ChildItem -LiteralPath $j.Dir -Filter 'steam_appid.txt' -File -Recurse -Depth 3 -ErrorAction SilentlyContinue)) {
-                $t = (Get-Content $f.FullName -Raw).Trim(); if ($t -match '^\d+$' -and $t -ne '480') { $id = $t; break } } }
+            if (-not $id) { foreach ($f in @(& $walk $j.Dir 'OnlineFix*.ini' 3)) {
+                if ($f.Length -lt 65536 -and (Get-Content -LiteralPath $f.FullName -Raw) -match '(?im)^\s*RealAppId\s*=\s*(\d+)') { $id = $Matches[1]; break } } }
+            if (-not $id) { foreach ($f in @(& $walk $j.Dir 'steam_appid.txt' 3)) {
+                $t = $(if ($f.Length -lt 1024) { (Get-Content -LiteralPath $f.FullName -Raw).Trim() } else { '' }); if ($t -match '^\d+$' -and $t -ne '480') { $id = $t; break } } }
             if (-not $id -and $j.Term) {
                 $t = $j.Term
                 $vars = @($t, ($t -creplace '([a-z])([A-Z])', '$1 $2' -creplace '([A-Za-z])(\d)', '$1 $2'), ($t -split '\s[-:]\s|:\s')[0], (($t -replace '(?i)\b(remastered|remake|enhanced|special|anniversary|director.s cut|edition|the)\b', ' ') -replace '\s+', ' ').Trim())
@@ -357,6 +490,7 @@ $coverSb = {
                 foreach ($v in $vars) { $id = & $search $v $false; if ($id) { break } }
                 if (-not $id -and $vars) { $id = & $search $vars[0] $true }
             }
+            if ($id -and "$id" -notmatch '^\d+$') { $id = $null }
             $ok = $false
             if ($id -and -not $j.SkipCover) {
                 $base = "https://cdn.cloudflare.steamstatic.com/steam/apps/$id/"
@@ -374,8 +508,14 @@ $coverSb = {
 $sizeSb = {
     param($jobs, $q)
     foreach ($j in $jobs) {
-        $s = 0L
-        try { foreach ($f in [IO.Directory]::EnumerateFiles($j.Dir, '*', [IO.SearchOption]::AllDirectories)) { try { $s += ([IO.FileInfo]$f).Length } catch {} } } catch {}
+        $s = 0L; $stack = New-Object 'System.Collections.Generic.Stack[string]'; $stack.Push($j.Dir)
+        while ($stack.Count) {
+            $cur = $stack.Pop()
+            try {
+                foreach ($f in [IO.Directory]::EnumerateFiles($cur)) { try { $s += ([IO.FileInfo]$f).Length } catch {} }
+                foreach ($x in [IO.Directory]::EnumerateDirectories($cur)) { if (([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push($x) } }
+            } catch {}
+        }
         $q.Enqueue([pscustomobject]@{ T = 'size'; K = $j.Key; V = $s })
     }
 }
@@ -423,6 +563,7 @@ $newsSb = {
     }
 }
 function Start-NewsCheck($force = $false) {
+    if ("$($script:cfg['ui:online'])" -eq 'Off') { return }
     $now = [DateTime]::UtcNow.Ticks; $jobs = @()
     foreach ($g in $script:games) {
         $id = "$($script:cfg['app:' + $g.Key])"; if ($id -notmatch '^\d+$') { continue }
@@ -728,7 +869,9 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
          <Button x:Name="btnExe" Content="Set .exe" Style="{StaticResource Btn}"/>
          <Button x:Name="btnFind" Content="Find cover online..." Style="{StaticResource Btn}"/>
          <Button x:Name="btnCover" Content="Set cover image" Style="{StaticResource Btn}"/>
-         <Button x:Name="btnUn" Content="Uninstall completely" Style="{StaticResource Btn}" Background="#C42B1C"/>
+         <Button x:Name="btnSaves" Content="Back up saves" Style="{StaticResource Btn}"/>
+      <Button x:Name="btnRestore" Content="Restore saved games" Style="{StaticResource Btn}" Visibility="Collapsed"/>
+      <Button x:Name="btnUn" Content="Uninstall completely" Style="{StaticResource Btn}" Background="#C42B1C"/>
         </StackPanel></Border></Popup>
      </StackPanel></ScrollViewer>
     </Grid>
@@ -747,7 +890,7 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
      <TextBlock Text="LIBRARY" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><Button x:Name="btnFold" Content="Game folders..." Style="{StaticResource Btn}" Margin="0,8,0,8"/><Button x:Name="btnStor" Content="Storage dashboard..." Style="{StaticResource Btn}" Margin="0,0,0,8"/><Button x:Name="btnUpdate" Content="Check for app updates" Style="{StaticResource Btn}" Margin="0,0,0,20"/><TextBlock Text="THEME" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optTheme" Margin="0,8,0,20"><RadioButton Content="Dark" Tag="Dark" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Midnight" Tag="Midnight" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Slate" Tag="Slate" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Light" Tag="Light" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ACCENT COLOUR" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/>
      <WrapPanel x:Name="swatches" Margin="0,8,0,4"/>
      <StackPanel Orientation="Horizontal" Margin="0,0,0,20"><Border Background="{DynamicResource UiCard}" CornerRadius="8" Padding="10,2" Margin="0,0,8,0"><TextBox x:Name="hexBox" Width="96" Background="Transparent" Foreground="{DynamicResource UiText}" CaretBrush="{DynamicResource UiText}" BorderThickness="0" Padding="0,6" FontSize="13"/></Border><Button x:Name="btnHex" Content="Apply" Style="{StaticResource Btn}" Padding="14,7" Margin="0"/></StackPanel>
-     <TextBlock Text="POSTER SIZE" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optSize" Margin="0,8,0,20"><RadioButton Content="Small" Tag="Small" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Medium" Tag="Medium" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Large" Tag="Large" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="BACKGROUND" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optBg" Margin="0,8,0,20"><RadioButton Content="Solid" Tag="Solid" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Glow" Tag="Glow" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="CORNERS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optRound" Margin="0,8,0,20"><RadioButton Content="Sharp" Tag="Sharp" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Soft" Tag="Soft" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Round" Tag="Round" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ANIMATION SPEED" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optAnim" Margin="0,8,0,20"><RadioButton Content="Off" Tag="Off" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Fast" Tag="Fast" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Normal" Tag="Normal" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Relaxed" Tag="Relaxed" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel>
+     <TextBlock Text="POSTER SIZE" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optSize" Margin="0,8,0,20"><RadioButton Content="Small" Tag="Small" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Medium" Tag="Medium" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Large" Tag="Large" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="BACKGROUND" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optBg" Margin="0,8,0,20"><RadioButton Content="Solid" Tag="Solid" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Glow" Tag="Glow" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="CORNERS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optRound" Margin="0,8,0,20"><RadioButton Content="Sharp" Tag="Sharp" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Soft" Tag="Soft" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Round" Tag="Round" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ANIMATION SPEED" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optAnim" Margin="0,8,0,20"><RadioButton Content="Off" Tag="Off" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Fast" Tag="Fast" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Normal" Tag="Normal" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Relaxed" Tag="Relaxed" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ONLINE LOOKUPS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optOnline" Margin="0,8,0,6"><RadioButton Content="On" Tag="On" GroupName="ol" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Off" Tag="Off" GroupName="ol" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="Covers, genres and patch notes send game names or Steam IDs to Steam and SteamSpy. Turn off to keep everything local." FontSize="11.5" TextWrapping="Wrap" Foreground="{DynamicResource UiMuted}" Margin="0,0,0,20"/>
      <Button x:Name="btnReset" Content="Reset to default" Style="{StaticResource Btn}" Margin="0,4,0,0"/>
     </StackPanel></ScrollViewer></Grid></Border>
   <Border x:Name="storage" Grid.RowSpan="3" HorizontalAlignment="Right" Width="360" Visibility="Collapsed" Background="{DynamicResource UiPanel2}" BorderBrush="{DynamicResource UiCard}" BorderThickness="1,0,0,0" Padding="24,20,24,16">
@@ -760,7 +903,7 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
 </Window>
 '@) } catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; [void][Windows.MessageBox]::Show("Window XAML failed:`n`n$($e.Message)", 'Repack Shelf', 'OK', 'Error'); exit 1 }
 $w.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'UiWinBg'); $w.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'UiText')
-foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','busy','btnUpdate','btnStor','storage','storBody','btnCloseStor','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','sortChips','viewChips','favChip','updChip','genreBtn','genrePop','genreClear','catChips','btnMore','morePop','btnSeen','btnNotes','optRound','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
+foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','btnSaves','btnRestore','busy','btnUpdate','btnStor','storage','storBody','btnCloseStor','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','sortChips','viewChips','favChip','updChip','genreBtn','genrePop','genreClear','catChips','btnMore','morePop','btnSeen','btnNotes','optRound','optOnline','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
 $w.Title = if ($AppVersion.StartsWith('__')) { 'Repack Shelf (dev build)' } else { "Repack Shelf v$AppVersion" }
 $script:filter = 'All'; $script:games = @(); $script:byKey = @{}
 
@@ -814,7 +957,7 @@ function Scan-And-Show($full = $false) {
     foreach ($g in $script:games) { $script:byKey[$g.Key] = $g }
     Rebuild-Cats; Refresh-UpdChip; $script:scanning = $false; $btnScan.IsEnabled = $true; $w.Cursor = $null; $busy.IsIndeterminate = $true; $busy.Visibility = 'Collapsed'
     if ($full -or $script:games.Count -eq 0 -or $before -ne (& $sig $script:games)) { Refresh-List }
-    $cj = @(); $sj = @()
+    $cj = @(); $sj = @(); $online = ("$($script:cfg['ui:online'])" -ne 'Off')
     foreach ($g in $script:games) {
         $c = Cache-Path $g.Key; $none = "$c.none"
         if (-not $g.Size -or $g.Bytes -le 0 -or $full) { $sj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir } }
@@ -824,24 +967,280 @@ function Scan-And-Show($full = $false) {
             $ak = "app:$($g.Key)"; $aid = "$($script:cfg[$ak])"
             $cj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir; Term = (Get-Term $g.Name); Cache = $c; Id = $(if ($aid -match '^\d+$') { $aid }); SkipCover = (-not $needC); NeedGenres = $needG } }
     }
-    if ($cj) { Start-Bg $coverSb $cj }
+    if ($cj -and $online) { Start-Bg $coverSb $cj }
     if ($sj) { Start-Bg $sizeSb $sj }
     Start-NewsCheck $full
-    $status.Text = "Found $($script:games.Count) game(s). $(if ($cj) { 'Fetching cover art and genres in the background...' })"
+    $status.Text = "Found $($script:games.Count) game(s). $(if ($cj -and $online) { 'Fetching cover art and genres in the background...' })"
     Save-Library
 }
-function Finish-Remove($i, $confirmed) {
-    if (Test-Path -LiteralPath $i.Dir) {
-        if ($confirmed -or (Ask "Leftover files remain in:`n$($i.Dir)`n`nDelete them? Anything stored there, such as saves or mods, will be lost.")) {
-            try { Remove-Item -LiteralPath $i.Dir -Recurse -Force -ErrorAction Stop } catch { Tell "Could not delete everything: $($_.Exception.Message)`n`nTry running Repack Shelf as administrator." }
+# ---------- keep saves when removing a game ----------
+$script:savesRoot = Join-Path $appDir 'saves'
+function Get-Slug($s) { (("$s").ToLower() -replace '[^a-z0-9]+', '-').Trim('-') }
+function Norm($s) { ("$s" -replace '[^a-zA-Z0-9]', '').ToLower() }
+function Get-BackupSlug($g) { $s = Get-Slug (Get-Term $g.Name); if (-not $s) { $s = 'game-' + (Get-Slug $g.Key) }; $s }
+function Get-LatestBackup($g) {
+    try {
+        $d = Join-Path $script:savesRoot (Get-BackupSlug $g)
+        if (-not (Test-Path -LiteralPath $d)) { return $null }
+        Get-ChildItem -LiteralPath $d -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending |
+            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json') } | Select-Object -First 1 -ExpandProperty FullName
+    } catch { $null }
+}
+function Get-DirSizeCap($d, $cap) {
+    $s = 0L; $stack = New-Object 'System.Collections.Generic.Stack[string]'; $stack.Push($d)
+    while ($stack.Count) {
+        $cur = $stack.Pop()
+        try {
+            foreach ($f in [IO.Directory]::EnumerateFiles($cur)) { try { $s += ([IO.FileInfo]$f).Length } catch {} }
+            if ($s -gt $cap) { return -1 }
+            foreach ($x in [IO.Directory]::EnumerateDirectories($cur)) { if (([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push($x) } }
+        } catch {}
+    }
+    $s
+}
+# Copies a folder tree without following junctions/symlinks. Returns the number of files that could not be copied.
+function Copy-DirSafe($src, $dst) {
+    $fail = 0
+    $stack = New-Object 'System.Collections.Generic.Stack[object]'; $stack.Push([pscustomobject]@{ S = $src; D = $dst })
+    while ($stack.Count) {
+        $p = $stack.Pop()
+        try { [void][IO.Directory]::CreateDirectory($p.D) } catch { $fail++; continue }
+        try {
+            foreach ($f in [IO.Directory]::EnumerateFiles($p.S)) {
+                try { [IO.File]::Copy($f, (Join-Path $p.D ([IO.Path]::GetFileName($f))), $true) } catch { $fail++; Write-Log "Save copy failed: $f - $($_.Exception.Message)" }
+            }
+            foreach ($x in [IO.Directory]::EnumerateDirectories($p.S)) {
+                if (([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push([pscustomobject]@{ S = $x; D = (Join-Path $p.D ([IO.Path]::GetFileName($x))) }) }
+            }
+        } catch { $fail++ }
+    }
+    $fail
+}
+function New-SaveCand($path, $kind, $rel, $label) {
+    $sz = Get-DirSizeCap $path 2GB
+    if ($sz -eq 0) { return $null }
+    $o = New-Object RsSave; $o.Location = $path; $o.Kind = $kind; $o.Rel = $rel; $o.Label = $label; $o.Bytes = $sz; $o.Checked = ($sz -gt 0)
+    $o
+}
+function Add-SaveCand($path, $kind, $rel, $label) {
+    $k = "$path".TrimEnd('\').ToLower()
+    if ($script:saveSeen[$k]) { return }
+    foreach ($e in @($script:saveSeen.Keys)) { if ($k.StartsWith("$e\") -or $e.StartsWith("$k\")) { return } }
+    $c = New-SaveCand $path $kind $rel $label
+    if ($c) { $script:saveSeen[$k] = 1; [void]$script:saveList.Add($c) }
+}
+function Test-NameMatch($n, $t, $eb) {
+    $x = Norm $n
+    if ($x.Length -lt 4) { return $false }
+    if ($t.Length -ge 4 -and ($x -eq $t -or ($t.Length -ge 6 -and $x.Length -ge 6 -and ($x.Contains($t) -or $t.Contains($x))))) { return $true }
+    if ($eb.Length -ge 5 -and $x -eq $eb) { return $true }
+    $false
+}
+# Looks in the places games usually keep saves: inside the game folder, Steam-emulator save folders (by App ID), and
+# folders under Documents / AppData / Saved Games whose name matches the game.
+function Find-SaveCandidates($g) {
+    $script:saveList = New-Object 'System.Collections.Generic.List[object]'; $script:saveSeen = @{}
+    # 1. save-like folders inside the game's own folder (these are lost when the folder is deleted)
+    if ($g.Dir -and (Test-Path -LiteralPath $g.Dir)) {
+        $root = "$($g.Dir)".TrimEnd('\')
+        $stack = New-Object 'System.Collections.Generic.Stack[object]'; $stack.Push([pscustomobject]@{ P = $root; L = 0 })
+        while ($stack.Count) {
+            $c = $stack.Pop()
+            try {
+                foreach ($x in [IO.Directory]::EnumerateDirectories($c.P)) {
+                    if (([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    $nm = [IO.Path]::GetFileName($x)
+                    if ($nm -match '(?i)^(saves?|save[ _-]?games?|save[ _-]?data|profiles?|user[ _-]?data|player[ _-]?data)$') { Add-SaveCand $x 'gamedir' $x.Substring($root.Length).TrimStart('\') 'Inside the game folder' }
+                    elseif ($c.L -lt 3) { $stack.Push([pscustomobject]@{ P = $x; L = $c.L + 1 }) }
+                }
+            } catch {}
         }
     }
-    if ($i.KeyPath -and (Test-Path -LiteralPath $i.KeyPath)) { Remove-Item -LiteralPath $i.KeyPath -Recurse -Force -ErrorAction SilentlyContinue }
+    # 2. Steam-emulator save folders named after the Steam App ID
+    $k = "app:$($g.Key)"; $id = "$($script:cfg[$k])"
+    if ($id -match '^\d+$') {
+        $cand = @((Join-Path $env:PUBLIC "Documents\OnlineFix\$id"), (Join-Path $env:APPDATA "Goldberg SteamEmu Saves\$id"))
+        $sd = Join-Path $env:PUBLIC 'Documents\Steam'
+        if (Test-Path -LiteralPath $sd) { try { foreach ($x in [IO.Directory]::EnumerateDirectories($sd)) { $cand += (Join-Path $x $id) } } catch {} }
+        foreach ($c in $cand) { if (Test-Path -LiteralPath $c -PathType Container) { Add-SaveCand $c 'abs' $null "Save data for Steam App ID $id" } }
+    }
+    # 3. folders whose name matches the game, one or two levels below the usual save locations
+    $t = Norm (Get-Term $g.Name); $eb = if ($g.Exe) { Norm ([IO.Path]::GetFileNameWithoutExtension($g.Exe)) } else { '' }
+    $skip = @('microsoft', 'packages', 'temp', 'programs', 'nvidia', 'nvidiacorporation', 'intel', 'amd', 'google', 'mozilla', 'adobe', 'discord', 'steam', 'crashdumps', 'd3dscache', 'connecteddevicesplatform', 'publishers', 'history', 'comms', 'apps', 'onedrive')
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    $roots = @($docs, (Join-Path $docs 'My Games'), (Join-Path $env:USERPROFILE 'Saved Games'), $env:APPDATA, $env:LOCALAPPDATA, (Join-Path $env:USERPROFILE 'AppData\LocalLow'), (Join-Path $env:PUBLIC 'Documents'))
+    foreach ($r in ($roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)) {
+        try {
+            foreach ($d1 in [IO.Directory]::EnumerateDirectories($r)) {
+                if (([IO.File]::GetAttributes($d1) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                $n1 = [IO.Path]::GetFileName($d1)
+                if ($skip -contains (Norm $n1)) { continue }
+                if (Test-NameMatch $n1 $t $eb) { Add-SaveCand $d1 'abs' $null 'Folder named after the game'; continue }
+                try {
+                    foreach ($d2 in [IO.Directory]::EnumerateDirectories($d1)) {
+                        if (([IO.File]::GetAttributes($d2) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                        if (Test-NameMatch ([IO.Path]::GetFileName($d2)) $t $eb) { Add-SaveCand $d2 'abs' $null "Folder named after the game (in $n1)" }
+                    }
+                } catch {}
+            }
+        } catch {}
+    }
+    @($script:saveList)
+}
+function Test-RestoreTarget($dst, $g) {
+    try { $p = [IO.Path]::GetFullPath("$dst").TrimEnd('\') } catch { return $false }
+    if (-not (Test-LocalPath $p) -or $p.Length -le 3) { return $false }
+    $win = "$env:WINDIR".TrimEnd('\')
+    if ($p -ieq $win -or $p.StartsWith("$win\", [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $gd = if ($g.Dir) { "$($g.Dir)".TrimEnd('\') } else { '' }
+    $inGame = $gd -and $p.StartsWith("$gd\", [StringComparison]::OrdinalIgnoreCase)
+    if (-not $inGame) {
+        foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) { if ($pf -and ($p -ieq $pf.TrimEnd('\') -or $p.StartsWith($pf.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase))) { return $false } }
+    }
+    $ok = $inGame
+    foreach ($root in @($env:USERPROFILE, $env:PUBLIC, $env:ProgramData)) { if ($root -and $p.StartsWith("$($root.TrimEnd('\'))\", [StringComparison]::OrdinalIgnoreCase)) { $ok = $true } }
+    $ok
+}
+function Show-SaveDialog($g, $cands, $mode) {
+    $dlg = Parse-Xaml (@'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ Title="Save games" Width="680" Height="500" WindowStartupLocation="CenterOwner" ShowInTaskbar="False" ResizeMode="NoResize" FontFamily="Segoe UI Variable Text, Segoe UI">
+ <Grid Margin="24">
+  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <StackPanel>
+   <TextBlock x:Name="dTitle" FontSize="20" FontWeight="SemiBold" TextWrapping="Wrap"/>
+   <TextBlock x:Name="dHint" Margin="0,6,0,14" FontSize="12.5" TextWrapping="Wrap" Foreground="{DynamicResource UiSub}"/>
+  </StackPanel>
+  <ListBox x:Name="dList" Grid.Row="1" Background="{DynamicResource UiCard}" Foreground="{DynamicResource UiText}" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+   <ListBox.ItemTemplate><DataTemplate>
+    <Grid Margin="6,7"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+     <CheckBox IsChecked="{Binding Checked, Mode=TwoWay}" VerticalAlignment="Top" Margin="0,3,12,0"/>
+     <StackPanel Grid.Column="1"><TextBlock Text="{Binding Label}" FontWeight="SemiBold"/><TextBlock Text="{Binding Location}" FontSize="11.5" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource UiSub}"/><TextBlock Text="{Binding SizeText}" FontSize="11.5" Foreground="{DynamicResource UiMuted}"/></StackPanel>
+    </Grid></DataTemplate></ListBox.ItemTemplate>
+  </ListBox>
+  <Grid Grid.Row="2" Margin="0,16,0,0">
+   <Button x:Name="dAdd" Content="Add folder..." Style="{StaticResource Btn}" HorizontalAlignment="Left" Margin="0"/>
+   <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+    <Button x:Name="dSkip" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
+    <Button x:Name="dCancel" Content="Cancel" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
+    <Button x:Name="dGo" Style="{StaticResource Btn}" Background="{DynamicResource UiAccent}" Foreground="{DynamicResource UiAccentFg}" Margin="0"/>
+   </StackPanel>
+  </Grid>
+ </Grid>
+</Window>
+'@)
+    $dlg.Owner = $w
+    $dlg.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'UiPanel'); $dlg.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'UiText')
+    $items = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
+    foreach ($c in @($cands)) { $items.Add($c) }
+    $dlg.FindName('dList').ItemsSource = $items
+    $dlg.FindName('dTitle').Text = if ($mode -eq 'uninstall') { "Keep the saves for $($g.Name)?" } else { "Back up saves for $($g.Name)" }
+    $dlg.FindName('dHint').Text = "Tick the folders to keep. They are copied to $script:savesRoot and can be restored after you reinstall the game. Folders over 2 GB are unticked. If a save folder is missing from the list, use Add folder." + $(if ($items.Count -eq 0) { "`n`nNo save folders were found automatically." } else { '' })
+    $dlg.FindName('dGo').Content = if ($mode -eq 'uninstall') { 'Back up, then uninstall' } else { 'Back up selected' }
+    $skip = $dlg.FindName('dSkip'); $skip.Content = 'Uninstall without saves'; if ($mode -ne 'uninstall') { $skip.Visibility = 'Collapsed' }
+    $script:saveDlgWin = $dlg; $script:saveDlgItems = $items; $script:saveDlgResult = 'cancel'; $script:saveDlgGame = $g
+    $dlg.FindName('dGo').Add_Click({ $script:saveDlgResult = 'go'; $script:saveDlgWin.Close() })
+    $skip.Add_Click({ $script:saveDlgResult = 'skip'; $script:saveDlgWin.Close() })
+    $dlg.FindName('dCancel').Add_Click({ $script:saveDlgResult = 'cancel'; $script:saveDlgWin.Close() })
+    $dlg.FindName('dAdd').Add_Click({
+        $fb = New-Object System.Windows.Forms.FolderBrowserDialog; $fb.Description = 'Pick a save folder to keep'
+        if ($fb.ShowDialog() -eq 'OK') {
+            $sp = "$($fb.SelectedPath)"
+            if (-not (Test-LocalPath $sp) -or $sp.TrimEnd('\').Length -le 2) { Tell 'Pick a folder on a local drive, not a whole drive.'; return }
+            $c = New-SaveCand $sp 'abs' $null 'Added by you'
+            if ($c) { $script:saveDlgItems.Add($c) } else { Tell 'That folder is empty.' }
+        }
+    })
+    [void]$dlg.ShowDialog()
+    [pscustomobject]@{ Result = $script:saveDlgResult; Items = @($items | Where-Object { $_.Checked }) }
+}
+function Backup-Saves($g, $items) {
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $dest = Join-Path (Join-Path $script:savesRoot (Get-BackupSlug $g)) $stamp
+    [void][IO.Directory]::CreateDirectory($dest)
+    $w.Cursor = 'Wait'; $w.Dispatcher.Invoke([action]{}, 'Render')
+    $man = @(); $i = 0; $failed = 0
+    foreach ($it in $items) {
+        $failed += [int](Copy-DirSafe $it.Location (Join-Path $dest "$i"))
+        $man += [pscustomobject]@{ Kind = $it.Kind; Src = $it.Location; Rel = $it.Rel; Sub = "$i"; Label = $it.Label }
+        $i++
+    }
+    $k = "app:$($g.Key)"
+    Write-Atomic (Join-Path $dest 'manifest.json') ([pscustomobject]@{ v = 1; game = $g.Name; appId = "$($script:cfg[$k])"; created = (Get-Date).ToString('s'); items = $man } | ConvertTo-Json -Depth 4)
+    $w.Cursor = $null
+    Write-Log "Saves backed up for $($g.Name): $i folder(s), $failed failed -> $dest"
+    [pscustomobject]@{ Dest = $dest; Failed = $failed }
+}
+# Used by the uninstall button. Returns $false when the user cancels the whole uninstall.
+function Offer-SaveBackup($g) {
+    $r = [Windows.MessageBox]::Show("Keep your save games before removing $($g.Name)?`n`nYes = find the saves and back them up first (recommended)`nNo = remove the game without keeping saves`nCancel = stop", 'Repack Shelf', 'YesNoCancel', 'Question')
+    if ($r -eq 'Cancel') { return $false }
+    if ($r -eq 'No') { return $true }
+    $w.Cursor = 'Wait'; $w.Dispatcher.Invoke([action]{}, 'Render')
+    $c = @(Find-SaveCandidates $g)
+    $w.Cursor = $null
+    $d = Show-SaveDialog $g $c 'uninstall'
+    if ($d.Result -eq 'cancel') { return $false }
+    if ($d.Result -eq 'skip') { return $true }
+    if ($d.Items.Count -eq 0) { return (Ask 'Nothing is ticked, so no saves will be kept. Remove the game anyway?') }
+    $res = Backup-Saves $g $d.Items
+    if ($res.Failed -gt 0) { return (Ask "$($res.Failed) file(s) could not be copied (they may be in use). Remove the game anyway?") }
+    Tell "Saves backed up to:`n$($res.Dest)`n`nAfter you reinstall the game, select it and use Restore saved games."
+    $true
+}
+function Backup-Flow($g) {
+    $w.Cursor = 'Wait'; $w.Dispatcher.Invoke([action]{}, 'Render')
+    $c = @(Find-SaveCandidates $g)
+    $w.Cursor = $null
+    $d = Show-SaveDialog $g $c 'backup'
+    if ($d.Result -ne 'go') { return }
+    if ($d.Items.Count -eq 0) { Tell 'Nothing was ticked, so nothing was backed up.'; return }
+    $res = Backup-Saves $g $d.Items
+    $msg = "Saves backed up to:`n$($res.Dest)"; if ($res.Failed -gt 0) { $msg += "`n`n$($res.Failed) file(s) could not be copied (they may be in use)." }
+    Tell $msg
+    $btnRestore.Visibility = 'Visible'
+}
+function Restore-Flow($g) {
+    $bd = Get-LatestBackup $g
+    if (-not $bd) { Tell 'No backed-up saves were found for this game.'; return }
+    try { $man = Get-Content -LiteralPath (Join-Path $bd 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Tell 'That backup could not be read.'; return }
+    $plan = @()
+    foreach ($it in @($man.items)) {
+        if ("$($it.Sub)" -notmatch '^\d+$') { continue }
+        $src = Join-Path $bd "$($it.Sub)"
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        $dst = if ("$($it.Kind)" -eq 'gamedir') { Join-Path $g.Dir "$($it.Rel)" } else { "$($it.Src)" }
+        if (Test-RestoreTarget $dst $g) { $plan += [pscustomobject]@{ Src = $src; Dst = $dst } }
+    }
+    if ($plan.Count -eq 0) { Tell 'Nothing in this backup can be restored to a safe location.'; return }
+    $when = try { ([datetime]"$($man.created)").ToString('d MMM yyyy HH:mm') } catch { 'an earlier date' }
+    if (-not (Ask "Restore the saved games for $($g.Name)?`n`nBackup from $when, $($plan.Count) folder(s). Files with the same names will be overwritten.`n`n$(($plan | ForEach-Object { $_.Dst }) -join "`n")")) { return }
+    $w.Cursor = 'Wait'; $w.Dispatcher.Invoke([action]{}, 'Render')
+    $failed = 0
+    foreach ($p in $plan) { $failed += [int](Copy-DirSafe $p.Src $p.Dst) }
+    $w.Cursor = $null
+    Write-Log "Saves restored for $($g.Name): $($plan.Count) folder(s), $failed failed"
+    Tell $(if ($failed -gt 0) { "Restored, but $failed file(s) could not be copied." } else { 'Your saved games were restored.' })
+}
+$btnSaves.Add_Click({ $g = $list.SelectedItem; if ($g) { Backup-Flow $g } })
+$btnRestore.Add_Click({ $g = $list.SelectedItem; if ($g) { Restore-Flow $g } })
+function Finish-Remove($i, $confirmed) {
+    if (Test-Path -LiteralPath $i.Dir) {
+        if (-not (Test-SafeDeleteTarget $i.Dir)) {
+            Write-Log "Refused to delete protected folder: $($i.Dir)"
+            Tell "Repack Shelf will not delete this folder because it looks like a system, personal or library folder:`n$($i.Dir)`n`nIf you are sure, delete it yourself in Explorer."
+        } elseif ($confirmed -or (Ask "Leftover files remain in:`n$($i.Dir)`n`nDelete them? Anything stored there, such as saves or mods, will be lost.")) {
+            try { Remove-GameDir $i.Dir } catch { Write-Log "Delete failed: $($_.Exception.Message)"; Tell "Could not delete everything: $($_.Exception.Message)`n`nTry running Repack Shelf as administrator." }
+        }
+    }
+    if ($i.KeyPath -and (Test-UninstallKey $i.KeyPath) -and (Test-Path -LiteralPath $i.KeyPath)) { Remove-Item -LiteralPath $i.KeyPath -Recurse -Force -ErrorAction SilentlyContinue }
     Scan-And-Show
 }
 function Play {
     $g = $list.SelectedItem
-    if ($g -and $g.Exe) { try { Start-Process -FilePath $g.Exe -WorkingDirectory (Split-Path $g.Exe); $status.Text = "Launched $($g.Name)." } catch { Tell "Could not launch: $($_.Exception.Message)" } }
+    if (-not $g -or -not $g.Exe) { return }
+    if (-not (Test-LocalExe $g.Exe)) { Tell 'That program is missing or is not on a local drive. Use Set .exe to choose it again.'; return }
+    try { Start-Process -FilePath $g.Exe -WorkingDirectory (Split-Path $g.Exe); $status.Text = "Launched $($g.Name)." } catch { Tell "Could not launch: $($_.Exception.Message)" }
 }
 
 function Check-Update($manual) {
@@ -851,6 +1250,12 @@ function Check-Update($manual) {
 }
 function Show-Update($m) {
     if (-not $m.Ok) { if ($m.Manual) { Tell 'Could not reach GitHub. Check your internet connection and try again.' }; return }
+    if ("$($m.Tag)" -notmatch '^v?\d+(\.\d+){1,3}$') { return }
+    # downloads must come from this repository's own release path
+    $pref = "https://github.com/$RepoSlug/releases/download/"
+    if ($m.Url -and -not "$($m.Url)".StartsWith($pref, [StringComparison]::OrdinalIgnoreCase)) { $m.Url = $null }
+    if ($m.Sha -and -not "$($m.Sha)".StartsWith($pref, [StringComparison]::OrdinalIgnoreCase)) { $m.Sha = $null }
+    if ($m.Page -and -not (Test-SafeUrl $m.Page)) { $m.Page = "https://github.com/$RepoSlug/releases" }
     $newV = $null; $curV = $null
     try { $newV = [version]($m.Tag.TrimStart('v')); $curV = [version]$AppVersion } catch {}
     if ($newV -and $curV -and $newV -gt $curV) {
@@ -863,37 +1268,60 @@ function Show-Update($m) {
 function Install-Update {
     $m = $script:upd
     $self = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-    if (-not $m.Url -or -not $m.Sha -or $self -notmatch '(?i)\.exe$' -or $self -match '(?i)\\(powershell|pwsh|powershell_ise)\.exe$') { Start-Process $m.Page; return }
-    $dir = Split-Path $self; $new = Join-Path $dir 'RepackShelf.update.exe'
+    $page = if ($m.Page) { $m.Page } else { "https://github.com/$RepoSlug/releases" }
+    if (-not $m.Url -or -not $m.Sha -or $self -notmatch '(?i)\.exe$' -or $self -match '(?i)\\(powershell|pwsh|powershell_ise)\.exe$' -or $self -match '[%^&!"]') { Open-SafeUrl $page; return }
+    $dir = Split-Path $self
     try { $t = Join-Path $dir '.rs_write_test'; Set-Content $t 'x' -ErrorAction Stop; Remove-Item $t -ErrorAction SilentlyContinue }
-    catch { Tell "Repack Shelf cannot write to its own folder, so it cannot replace itself there.`nOpening the download page instead."; Start-Process $m.Page; return }
+    catch { Tell "Repack Shelf cannot write to its own folder, so it cannot replace itself there.`nOpening the download page instead."; Open-SafeUrl $page; return }
+    # stage in the app's private data folder under a random name, not next to the exe
+    $stage = Join-Path $appDir 'update'; New-Item -ItemType Directory -Force $stage | Out-Null
+    Get-ChildItem -LiteralPath $stage -File -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    $tag = [guid]::NewGuid().ToString('N')
+    $new = Join-Path $stage "RepackShelf-$tag.exe"; $shaTmp = Join-Path $stage "$tag.sha"
+    if ($new -match '[%^&!"]') { Open-SafeUrl $page; return }
     $updTitle.Text = 'Downloading update...'; $updSub.Text = 'Please wait'; $btnUpd.IsEnabled = $false; $btnLater.IsEnabled = $false
     $w.Dispatcher.Invoke([action]{}, 'Render')
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $wc = New-Object Net.WebClient; $wc.Headers['User-Agent'] = 'RepackShelf'
-        $wc.DownloadFile($m.Url, $new)
-        $want = ($wc.DownloadString($m.Sha).Trim() -split '\s+')[0].ToLower()
+        $hosts = @('github.com', 'githubusercontent.com')
+        Save-Capped $m.Url $new 150MB $hosts
+        Save-Capped $m.Sha $shaTmp 4KB $hosts
+        $want = ((Get-Content -LiteralPath $shaTmp -Raw).Trim() -split '\s+')[0].ToLower()
         if ($want -notmatch '^[0-9a-f]{64}$') { throw 'The checksum file is not valid, so the download could not be verified.' }
-        if ((Get-FileHash $new -Algorithm SHA256).Hash.ToLower() -ne $want) { throw 'Checksum mismatch, the download could not be verified.' }
-        if ((Get-Item $new).Length -lt 10KB) { throw 'The downloaded file looks too small.' }
+        if ((Get-FileHash -LiteralPath $new -Algorithm SHA256).Hash.ToLower() -ne $want) { throw 'Checksum mismatch, the download could not be verified.' }
+        if ((Get-Item -LiteralPath $new).Length -lt 10KB) { throw 'The downloaded file looks too small.' }
+        $fs = [IO.File]::OpenRead($new); $b1 = $fs.ReadByte(); $b2 = $fs.ReadByte(); $fs.Dispose()
+        if ($b1 -ne 0x4D -or $b2 -ne 0x5A) { throw 'The downloaded file is not a Windows program.' }
+        if ($script:UpdateSignerThumbprint) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $new
+            if ($sig.Status -ne 'Valid' -or "$($sig.SignerCertificate.Thumbprint)" -ne $script:UpdateSignerThumbprint) { throw 'The update is not signed by the expected publisher.' }
+        }
     } catch {
-        Remove-Item $new -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $new, $shaTmp -ErrorAction SilentlyContinue
         Write-Log "Update failed: $($_.Exception.Message)"
         Tell "Update failed: $($_.Exception.Message)"
         $updTitle.Text = 'Update failed'; $updSub.Text = 'Try again later'; $btnUpd.IsEnabled = $true; $btnLater.IsEnabled = $true; return
     }
-    $bat = Join-Path $env:TEMP 'rs_update.bat'
-    $lines = '@echo off', 'set n=0', ':retry', 'set /a n+=1', 'ping -n 2 127.0.0.1 >nul', "move /y `"$new`" `"$self`" >nul 2>&1", 'if errorlevel 1 if %n% lss 30 goto retry', "start `"`" `"$self`"", 'del "%~f0"'
-    Set-Content $bat $lines -Encoding ASCII
+    Remove-Item -LiteralPath $shaTmp -ErrorAction SilentlyContinue
+    # the swap script re-checks the hash right before replacing the exe, and is written as UTF-8 so accented paths work
+    $bat = Join-Path $stage "update-$tag.bat"
+    $lines = @(
+        '@echo off', 'chcp 65001 >nul', 'setlocal', 'set n=0', ':retry', 'set /a n+=1', 'ping -n 2 127.0.0.1 >nul', 'set "H="',
+        "for /f `"skip=1 tokens=*`" %%h in ('certutil -hashfile `"$new`" SHA256') do if not defined H set `"H=%%h`"",
+        'set "H=%H: =%"',
+        "if /i not `"%H%`"==`"$want`" exit /b 1",
+        "move /y `"$new`" `"$self`" >nul 2>&1",
+        'if errorlevel 1 if %n% lss 30 goto retry',
+        "start `"`" `"$self`"",
+        'del "%~f0"')
+    [IO.File]::WriteAllLines($bat, [string[]]$lines, (New-Object Text.UTF8Encoding $false))
     Start-Process cmd.exe -ArgumentList '/c', "`"$bat`"" -WindowStyle Hidden
     $w.Close()
 }
 $script:upd = $null
 function Sync-Opts {
     $script:syncing = $true
-    $def = @{ theme = 'Dark'; size = 'Medium'; bg = 'Solid'; anim = 'Normal'; round = 'Soft' }
-    foreach ($pair in @(@($optTheme, 'theme'), @($optSize, 'size'), @($optBg, 'bg'), @($optAnim, 'anim'), @($optRound, 'round'))) {
+    $def = @{ theme = 'Dark'; size = 'Medium'; bg = 'Solid'; anim = 'Normal'; round = 'Soft'; online = 'On' }
+    foreach ($pair in @(@($optTheme, 'theme'), @($optSize, 'size'), @($optBg, 'bg'), @($optAnim, 'anim'), @($optRound, 'round'), @($optOnline, 'online'))) {
         $v = "$($script:cfg['ui:' + $pair[1]])"; if (-not $v) { $v = $def[$pair[1]] }; if ($v -eq 'On') { $v = 'Normal' }
         foreach ($rb in $pair[0].Children) { $rb.IsChecked = ($rb.Tag -eq $v) }
     }
@@ -904,9 +1332,10 @@ function Sync-Opts {
 }
 function Opt-Changed($rb) {
     if ($script:syncing) { return }
-    $k = switch ($rb.Parent.Name) { 'optTheme' { 'theme' } 'optSize' { 'size' } 'optBg' { 'bg' } 'optRound' { 'round' } default { 'anim' } }
+    $k = switch ($rb.Parent.Name) { 'optTheme' { 'theme' } 'optSize' { 'size' } 'optBg' { 'bg' } 'optRound' { 'round' } 'optOnline' { 'online' } default { 'anim' } }
     $script:cfg["ui:$k"] = $rb.Tag; Save-Cfg; Apply-Theme; Fade $w.Content 0.9 240
     if ($k -eq 'size') { $list.UpdateLayout(); Animate-In }
+    if ($k -eq 'online' -and $rb.Tag -eq 'On') { Scan-And-Show }
 }
 function Show-Settings { Sync-Opts; $settings.Visibility = 'Visible'; Anim-Slide $settings 'x' 380 380 }
 function Hide-Settings {
@@ -1031,7 +1460,7 @@ foreach ($hex in $Accents) {
     $b.Add_Click({ $script:cfg['ui:accent'] = $args[0].Tag; Save-Cfg; Apply-Theme; Sync-Opts })
     [void]$swatches.Children.Add($b)
 }
-foreach ($p in $optTheme, $optSize, $optBg, $optAnim, $optRound) { foreach ($rb in $p.Children) { $rb.Add_Checked({ Opt-Changed $args[0] }) } }
+foreach ($p in $optTheme, $optSize, $optBg, $optAnim, $optRound, $optOnline) { foreach ($rb in $p.Children) { $rb.Add_Checked({ Opt-Changed $args[0] }) } }
 $btnCustom.Add_Click({ if ($storage.Visibility -eq 'Visible') { Hide-Storage; Show-Settings } elseif ($settings.Visibility -eq 'Visible') { Hide-Settings } else { Show-Settings } })
 $btnStor.Add_Click({ Hide-Settings; Show-Storage })
 $btnCloseStor.Add_Click({ Hide-Storage })
@@ -1042,7 +1471,7 @@ $btnHex.Add_Click({
     $script:cfg['ui:accent'] = $h.ToUpper(); Save-Cfg; Apply-Theme; Sync-Opts
 })
 $btnReset.Add_Click({
-    foreach ($k in 'ui:theme', 'ui:accent', 'ui:size', 'ui:bg', 'ui:anim', 'ui:round') { $script:cfg.Remove($k) }
+    foreach ($k in 'ui:theme', 'ui:accent', 'ui:size', 'ui:bg', 'ui:anim', 'ui:round', 'ui:online') { $script:cfg.Remove($k) }
     Save-Cfg; Apply-Theme; Sync-Opts; Fade $w.Content 0.9 240
 })
 
@@ -1088,6 +1517,7 @@ $list.Add_SelectionChanged({
     if (-not $g) { return }
     $detail.DataContext = $g; $empty.Visibility = 'Collapsed'; $detail.Visibility = 'Visible'
     $btnPlay.IsEnabled = [bool]$g.Exe
+    $btnRestore.Visibility = if (Get-LatestBackup $g) { 'Visible' } else { 'Collapsed' }
     $btnNotes.Content = if ($g.HasUpd -and $g.NewsUrl) { 'Read latest patch notes' } elseif ("$($script:cfg['app:' + $g.Key])" -match '^\d+$') { 'Official patch notes (Steam)' } else { 'Find on Steam' }
     $btnSeen.Visibility = if ($g.HasUpd) { 'Visible' } else { 'Collapsed' }
     $btnUn.Content = if ($g.UnExe -or $g.KeyPath) { 'Uninstall completely' } else { 'Delete game folder' }
@@ -1174,10 +1604,9 @@ $list.AddHandler([Windows.Controls.Primitives.ButtonBase]::ClickEvent, [Windows.
 })
 $btnNotes.Add_Click({
     $g = $list.SelectedItem; if (-not $g) { return }
-    if ($g.HasUpd -and $g.NewsUrl) { Start-Process $g.NewsUrl; return }
     $k = "app:$($g.Key)"; $id = "$($script:cfg[$k])"
-    $url = if ($id -match '^\d+$') { "https://store.steampowered.com/news/app/$id" } else { 'https://store.steampowered.com/search/?term=' + [uri]::EscapeDataString((Get-Term $g.Name)) }
-    Start-Process $url
+    $hub = if ($id -match '^\d+$') { "https://store.steampowered.com/news/app/$id" } else { 'https://store.steampowered.com/search/?term=' + [uri]::EscapeDataString((Get-Term $g.Name)) }
+    if ($g.HasUpd -and $g.NewsUrl) { Open-SafeUrl $g.NewsUrl $hub } else { Open-SafeUrl $hub }
 })
 $btnScan.ToolTip = 'Click: quick refresh. Shift+click: full rescan.'
 $btnScan.Add_Click({ Scan-And-Show (([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift) -ne 0) })
@@ -1211,13 +1640,19 @@ $btnFold.Add_Click({
     $r = [Windows.MessageBox]::Show("Extra folders scanned for games (besides any 'Games' folder at a drive root):`n`n$(if ($cur) { $cur -join "`n" } else { '(none)' })`n`nYes = add a folder    No = clear this list    Cancel = close", 'Library folders', 'YesNoCancel', 'Question')
     if ($r -eq 'Yes') {
         $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Pick the folder that contains your game folders'
-        if ($d.ShowDialog() -eq 'OK') { $script:cfg['folders'] = @($cur + $d.SelectedPath | Select-Object -Unique); Save-Cfg; Scan-And-Show }
+        if ($d.ShowDialog() -eq 'OK') {
+            $sp = "$($d.SelectedPath)"
+            if (-not (Test-LocalPath $sp) -or $sp.TrimEnd('\').Length -le 2) { Tell 'Pick a folder on a local drive. A whole drive or a network location is not allowed.' }
+            else { $script:cfg['folders'] = @($cur + $sp | Select-Object -Unique); Save-Cfg; Scan-And-Show }
+        }
     } elseif ($r -eq 'No') { $script:cfg['folders'] = @(); Save-Cfg; Scan-And-Show }
 })
 $btnUn.Add_Click({
     $i = $list.SelectedItem
-    if ($i.UnExe -and (Test-Path -LiteralPath $i.UnExe)) {
-        if (-not (Ask "Uninstall $($i.Name)?`n`nIts own uninstaller runs first, then leftover files in`n$($i.Dir)`ncan be removed. Save games outside that folder are not touched.")) { return }
+    if ($i.UnExe -and (Test-LocalPath $i.UnExe) -and (Test-Path -LiteralPath $i.UnExe)) {
+        $warn = if (Test-InnoUninstaller $i.UnExe) { '' } else { "`n`nWARNING: this file does not look like a genuine Inno Setup uninstaller. Running it runs whatever the file contains." }
+        if (-not (Ask "Uninstall $($i.Name)?`n`nUninstaller: $($i.UnExe)$warn`n`nIts own uninstaller runs first, then leftover files in`n$($i.Dir)`ncan be removed. Save games outside that folder are not touched.")) { return }
+        if (-not (Offer-SaveBackup $i)) { return }
         Start-Process -FilePath $i.UnExe -WorkingDirectory (Split-Path $i.UnExe)
         $status.Text = 'Waiting for the uninstaller to finish...'
         $script:unI = $i; $script:unT0 = Get-Date
@@ -1229,7 +1664,8 @@ $btnUn.Add_Click({
             elseif (((Get-Date) - $script:unT0).TotalMinutes -gt 30) { $args[0].Stop(); $status.Text = 'Uninstall did not complete.' }
         })
         $t.Start()
-    } elseif (Ask "$($i.Name) has no uninstaller.`n`nPermanently delete its folder ($(Fmt (Get-DirSize $i.Dir)))?`n$($i.Dir)`n`nAnything stored inside, such as saves or mods, will be lost.") { Finish-Remove $i $true }
+    } elseif (-not (Test-SafeDeleteTarget $i.Dir)) { Tell "$($i.Name) has no uninstaller, and Repack Shelf will not delete this folder because it looks like a system, personal or library folder:`n$($i.Dir)"
+    } elseif (Ask "$($i.Name) has no uninstaller.`n`nPermanently delete its folder ($(Fmt (Get-DirSize $i.Dir)))?`n$($i.Dir)`n`nAnything stored inside, such as saves or mods, will be lost.") { if (Offer-SaveBackup $i) { Finish-Remove $i $true } }
 })
 
 # ---------- smooth wheel scrolling ----------

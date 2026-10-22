@@ -12,6 +12,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Stamp version and repository into the script
         shell: powershell
@@ -24,7 +26,7 @@ jobs:
 
       - name: Build exe
         shell: powershell
-        run: ./build/Build-Exe.ps1 -Version $env:VERSION
+        run: ./build/Build-Exe.ps1 -Version $env:VERSION -Ps2exeVersion "${{ vars.PS2EXE_VERSION }}"
 
       - name: Create checksum
         shell: powershell
