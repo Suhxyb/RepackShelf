@@ -16,23 +16,35 @@ Write-Host ("Using ps2exe {0}" -f (Get-Module ps2exe).Version)
 Add-Type -AssemblyName System.Drawing
 
 $dist = Join-Path $Root 'dist'; New-Item -ItemType Directory -Force $dist | Out-Null
-$ico = Join-Path $env:TEMP 'RepackShelf.ico'
-$bmp = New-Object Drawing.Bitmap 64, 64
-$g = [Drawing.Graphics]::FromImage($bmp); $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'AntiAliasGridFit'
-$p = New-Object Drawing.Drawing2D.GraphicsPath; $r = 14; $s = 62
-$p.AddArc(1, 1, $r * 2, $r * 2, 180, 90); $p.AddArc($s - $r * 2, 1, $r * 2, $r * 2, 270, 90)
-$p.AddArc($s - $r * 2, $s - $r * 2, $r * 2, $r * 2, 0, 90); $p.AddArc(1, $s - $r * 2, $r * 2, $r * 2, 90, 90); $p.CloseFigure()
-$br = New-Object Drawing.Drawing2D.LinearGradientBrush ((New-Object Drawing.Point 0, 0), (New-Object Drawing.Point 64, 64), [Drawing.Color]::FromArgb(96, 205, 255), [Drawing.Color]::FromArgb(123, 92, 255))
-$g.FillPath($br, $p)
-$f = New-Object Drawing.StringFormat; $f.Alignment = 'Center'; $f.LineAlignment = 'Center'
-$g.DrawString('R', (New-Object Drawing.Font 'Segoe UI', 34, ([Drawing.FontStyle]::Bold), ([Drawing.GraphicsUnit]::Pixel)), [Drawing.Brushes]::White, (New-Object Drawing.RectangleF 0, 2, 64, 64), $f)
-$fs = [IO.File]::Create($ico); [Drawing.Icon]::FromHandle($bmp.GetHicon()).Save($fs); $fs.Close()
+# Use your own icon if build\RepackShelf.ico exists (commit it so GitHub builds use it too); otherwise draw one.
+$custom = Join-Path $PSScriptRoot 'RepackShelf.ico'
+$useCustom = $false
+if (Test-Path -LiteralPath $custom) {
+    $hdr = @([IO.File]::ReadAllBytes($custom) | Select-Object -First 4)
+    if ($hdr.Count -eq 4 -and $hdr[0] -eq 0 -and $hdr[1] -eq 0 -and $hdr[2] -eq 1 -and $hdr[3] -eq 0) { $useCustom = $true }
+    else { Write-Warning 'build\RepackShelf.ico is not a valid .ico file, so a generated icon will be used instead.' }
+}
+if ($useCustom) { $ico = $custom }
+else {
+    $ico = Join-Path $env:TEMP 'RepackShelf.ico'
+    $bmp = New-Object Drawing.Bitmap 64, 64
+    $g = [Drawing.Graphics]::FromImage($bmp); $g.SmoothingMode = 'AntiAlias'; $g.TextRenderingHint = 'AntiAliasGridFit'
+    $p = New-Object Drawing.Drawing2D.GraphicsPath; $r = 14; $s = 62
+    $p.AddArc(1, 1, $r * 2, $r * 2, 180, 90); $p.AddArc($s - $r * 2, 1, $r * 2, $r * 2, 270, 90)
+    $p.AddArc($s - $r * 2, $s - $r * 2, $r * 2, $r * 2, 0, 90); $p.AddArc(1, $s - $r * 2, $r * 2, $r * 2, 90, 90); $p.CloseFigure()
+    $br = New-Object Drawing.Drawing2D.LinearGradientBrush ((New-Object Drawing.Point 0, 0), (New-Object Drawing.Point 64, 64), [Drawing.Color]::FromArgb(96, 205, 255), [Drawing.Color]::FromArgb(123, 92, 255))
+    $g.FillPath($br, $p)
+    $f = New-Object Drawing.StringFormat; $f.Alignment = 'Center'; $f.LineAlignment = 'Center'
+    $g.DrawString('R', (New-Object Drawing.Font 'Segoe UI', 34, ([Drawing.FontStyle]::Bold), ([Drawing.GraphicsUnit]::Pixel)), [Drawing.Brushes]::White, (New-Object Drawing.RectangleF 0, 2, 64, 64), $f)
+    $fs = [IO.File]::Create($ico); [Drawing.Icon]::FromHandle($bmp.GetHicon()).Save($fs); $fs.Close()
+}
+Write-Host ("Using icon: {0} ({1} bytes)" -f $ico, (Get-Item -LiteralPath $ico).Length)
 
 $fv = '0.0.0.0'
 try { $v = [version]$Version; $fv = '{0}.{1}.{2}.0' -f $v.Major, $v.Minor, [Math]::Max($v.Build, 0) } catch {}
 $out = Join-Path $dist 'RepackShelf.exe'
 Invoke-ps2exe -inputFile (Join-Path $Root 'src\RepackShelf.ps1') -outputFile $out -iconFile $ico -noConsole -STA -x64 `
     -title 'Repack Shelf' -product 'Repack Shelf' -description 'Game library manager' -version $fv
-Remove-Item $ico -ErrorAction SilentlyContinue
+if (-not $useCustom) { Remove-Item $ico -ErrorAction SilentlyContinue }
 if (-not (Test-Path $out)) { throw 'Build failed.' }
 Write-Host "Built $out" -ForegroundColor Green

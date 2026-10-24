@@ -33,10 +33,9 @@ using System; using System.Runtime.InteropServices;
 public static class Dwm { [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr h, int a, ref int v, int s); }
 "@
 Add-Type -TypeDefinition @'
+using System; using System.IO; using System.Media; using System.Collections.Generic;
 using System.ComponentModel;
 public class RsBadge { public string Text {get;set;} public string Color {get;set;} }
-public class RsSave { public bool Checked {get;set;} public string Location {get;set;} public string Label {get;set;} public string Kind {get;set;} public string Rel {get;set;} public long Bytes {get;set;}
-  public string SizeText { get { return Bytes < 0 ? "over 2 GB" : (Bytes >= 1073741824L ? (Bytes / 1073741824.0).ToString("0.0") + " GB" : (Bytes / 1048576.0).ToString("0") + " MB"); } } }
 public class RsGame : INotifyPropertyChanged {
   public event PropertyChangedEventHandler PropertyChanged;
   void N(string p) { var h = PropertyChanged; if (h != null) h(this, new PropertyChangedEventArgs(p)); }
@@ -52,6 +51,94 @@ public class RsGame : INotifyPropertyChanged {
   bool fav; public bool Fav { get { return fav; } set { fav = value; N("Fav"); N("FavMark"); } } public string FavMark { get { return fav ? "\u2605" : ""; } }
   public string TagLine { get { return (Tags ?? "").Replace(",", "  \u00B7  "); } }
   public string Meta { get { return "Folder   " + Dir + "\nSize   " + (Size ?? "calculating...") + "\nVersion   " + (Version ?? "n/a") + "\nInstalled   " + (Date ?? "n/a") + "\nLaunches   " + (Exe ?? "no executable found - use Set .exe") + (string.IsNullOrEmpty(gen) ? "" : "\nGenres   " + gen.Replace(",", ", ")) + (string.IsNullOrEmpty(upd) ? "" : "\nNew patch notes   " + upd); } }
+}
+
+// ---- Halloween sound effects: synthesised in memory (no sound files needed) ----
+public static class RsSfx {
+  const int SR = 22050;
+  static Dictionary<string, SoundPlayer> P = new Dictionary<string, SoundPlayer>();
+  static Dictionary<string, double> Len = new Dictionary<string, double>();
+  static Dictionary<string, int> Pri = new Dictionary<string, int>();
+  static Random R = new Random(1031);
+  static DateTime busyUntil = DateTime.MinValue; static int busyPri = 0; static DateTime lastHover = DateTime.MinValue;
+  static bool ready;
+  public static double Master = 0.1;
+  static double[] Buf(double sec) { return new double[(int)(sec * SR)]; }
+  static void Noise(double[] b, double at, double len, double lp, double gain, double decay, double modHz, double modDepth) {
+    int s = (int)(at * SR), n = (int)(len * SR); double y = 0, norm = Math.Sqrt((2.0 - lp) / lp) * 0.58;
+    for (int i = 0; i < n && s + i < b.Length; i++) {
+      double t = (double)i / SR; y += lp * ((R.NextDouble() * 2 - 1) - y);
+      double roll = 1.0 + modDepth * Math.Sin(2 * Math.PI * modHz * t);
+      b[s + i] += y * norm * gain * roll * Math.Exp(-t * decay) * Math.Min(1.0, t / 0.015);
+    }
+  }
+  static void Bell(double[] b, double at, double f, double len, double gain, double decay) {
+    int s = (int)(at * SR), n = (int)(len * SR);
+    for (int i = 0; i < n && s + i < b.Length; i++) {
+      double t = (double)i / SR;
+      double v = Math.Sin(2 * Math.PI * f * t) + 0.45 * Math.Sin(2 * Math.PI * f * 2.76 * t) * Math.Exp(-t * 2.0) + 0.25 * Math.Sin(2 * Math.PI * f * 5.4 * t) * Math.Exp(-t * 5.0);
+      b[s + i] += v * gain * Math.Exp(-t * decay) * Math.Min(1.0, t / 0.002);
+    }
+  }
+  static void Sweep(double[] b, double at, double len, double f0, double f1, double vibHz, double vibDepth, double gain) {
+    int s = (int)(at * SR), n = (int)(len * SR); double ph = 0;
+    for (int i = 0; i < n && s + i < b.Length; i++) {
+      double t = (double)i / SR, u = t / len;
+      double f = f0 + (f1 - f0) * u + vibDepth * Math.Sin(2 * Math.PI * vibHz * t);
+      ph += 2 * Math.PI * f / SR;
+      double env = Math.Pow(Math.Sin(Math.PI * u), 1.5);
+      b[s + i] += (Math.Sin(ph) + 0.35 * Math.Sin(2 * ph) + 0.15 * Math.Sin(3 * ph)) * env * gain;
+    }
+  }
+  static void Creak(double[] b, double at, double len, double f0, double f1, double gain) {
+    int s = (int)(at * SR), n = (int)(len * SR); double ph = 0, y = 0;
+    for (int i = 0; i < n && s + i < b.Length; i++) {
+      double t = (double)i / SR, u = t / len;
+      double f = f0 + (f1 - f0) * u + 35 * Math.Sin(2 * Math.PI * 7 * t) + 30 * (R.NextDouble() - 0.5);
+      ph += f / SR; double saw = 2 * (ph - Math.Floor(ph)) - 1;
+      double am = 0.55 + 0.45 * Math.Sin(2 * Math.PI * 26 * t);
+      y += 0.18 * (saw - y);
+      b[s + i] += y * am * Math.Sin(Math.PI * u) * gain;
+    }
+  }
+  static void Tick(double[] b, double at, double f, double len, double gain) {
+    int s = (int)(at * SR), n = (int)(len * SR);
+    for (int i = 0; i < n && s + i < b.Length; i++) { double t = (double)i / SR; b[s + i] += Math.Sin(2 * Math.PI * f * t) * Math.Exp(-t * 55) * gain; }
+  }
+  static byte[] Wav(double[] b, double peak) {
+    double m = 0; for (int i = 0; i < b.Length; i++) m = Math.Max(m, Math.Abs(b[i]));
+    double k = m > 0 ? peak / m : 1; int n = b.Length;
+    MemoryStream ms = new MemoryStream(44 + n * 2); BinaryWriter w = new BinaryWriter(ms);
+    w.Write(new char[] { 'R', 'I', 'F', 'F' }); w.Write(36 + n * 2); w.Write(new char[] { 'W', 'A', 'V', 'E' });
+    w.Write(new char[] { 'f', 'm', 't', ' ' }); w.Write(16); w.Write((short)1); w.Write((short)1); w.Write(SR); w.Write(SR * 2); w.Write((short)2); w.Write((short)16);
+    w.Write(new char[] { 'd', 'a', 't', 'a' }); w.Write(n * 2);
+    for (int i = 0; i < n; i++) { double fade = Math.Min(1.0, Math.Min(i / 40.0, (n - i) / 220.0)); w.Write((short)(b[i] * k * fade * 32000 * Master)); }
+    w.Flush(); return ms.ToArray();
+  }
+  static void Add(string name, double[] b, double peak, int pri) {
+    SoundPlayer p = new SoundPlayer(new MemoryStream(Wav(b, peak))); p.Load();
+    P[name] = p; Len[name] = b.Length / (double)SR; Pri[name] = pri;
+  }
+  public static void Init() {
+    if (ready) return; ready = true; double[] b;
+    b = Buf(2.6); Noise(b, 0, 2.3, 0.03, 0.9, 1.5, 2.6, 0.5); Sweep(b, 0.5, 1.7, 220, 196, 5.5, 6, 0.12); Bell(b, 1.0, 440.0, 1.6, 0.35, 2.2); Bell(b, 1.35, 311.1, 1.25, 0.3, 2.4); Add("boot", b, 0.75, 2);
+    b = Buf(0.07); Tick(b, 0, 330, 0.07, 1.0); Tick(b, 0, 495, 0.07, 0.4); Add("hover", b, 0.25, 0);
+    b = Buf(0.6); Bell(b, 0, 329.6, 0.6, 0.5, 6.0); Bell(b, 0, 349.2, 0.6, 0.35, 6.5); Add("select", b, 0.4, 1);
+    b = Buf(0.85); Bell(b, 0, 1318.5, 0.6, 0.4, 7.0); Bell(b, 0.07, 1568.0, 0.6, 0.4, 7.0); Bell(b, 0.14, 1975.5, 0.6, 0.35, 7.0); Bell(b, 0.21, 2637.0, 0.6, 0.3, 7.0); Add("fav", b, 0.35, 1);
+    b = Buf(1.8); Sweep(b, 0, 1.4, 110, 260, 5.0, 5, 0.5); Bell(b, 0.35, 82.4, 1.4, 0.9, 2.2); Bell(b, 0.35, 116.5, 1.2, 0.4, 2.6); Add("launch", b, 0.8, 2);
+    b = Buf(0.8); Creak(b, 0, 0.45, 160, 380, 0.6); Creak(b, 0.42, 0.3, 300, 200, 0.4); Add("creak", b, 0.35, 1);
+    b = Buf(1.9); Noise(b, 0, 1.9, 0.025, 1.0, 1.7, 3.1, 0.6); Noise(b, 0, 0.25, 0.3, 0.4, 10, 0, 0); Add("thunder", b, 0.85, 2);
+    b = Buf(0.4); Noise(b, 0, 0.4, 0.35, 0.6, 5.0, 20, 0.9); Add("bat", b, 0.25, 0);
+    b = Buf(0.5); Sweep(b, 0, 0.45, 1100, 330, 14, 40, 0.4); Add("spider", b, 0.22, 0);
+    b = Buf(1.4); Sweep(b, 0, 1.3, 300, 240, 5.5, 10, 0.5); Sweep(b, 0, 1.3, 452, 360, 5.5, 12, 0.2); Add("ghost", b, 0.5, 2);
+  }
+  public static void Play(string name) {
+    SoundPlayer p; if (!P.TryGetValue(name, out p)) return;
+    DateTime now = DateTime.UtcNow; int pr = Pri[name];
+    if (name == "hover") { if ((now - lastHover).TotalMilliseconds < 80) return; lastHover = now; }
+    if (now < busyUntil && pr < busyPri) return;
+    p.Play(); busyUntil = now.AddSeconds(Len[name] * 0.9); busyPri = pr;
+  }
 }
 '@
 
@@ -580,6 +667,7 @@ $Themes = @{
     Dark     = @{ Bg = '#1B1B1D'; Panel = '#242427'; Panel2 = '#2F2F34'; Card = '#2B2B2E'; Btn = '#38383C'; Hover = '#2E2E32'; Text = '#F3F3F3'; Sub = '#B4B4B8'; Muted = '#808085'; ChipText = '#DDDDDD'; Thumb = '#5A5A5F'; IsDark = $true }
     Midnight = @{ Bg = '#000000'; Panel = '#0C0C0E'; Panel2 = '#141417'; Card = '#131316'; Btn = '#1F1F23'; Hover = '#18181B'; Text = '#F3F3F3'; Sub = '#A2A2A8'; Muted = '#6F6F78'; ChipText = '#D0D0D0'; Thumb = '#3A3A40'; IsDark = $true }
     Slate    = @{ Bg = '#151A21'; Panel = '#1C232C'; Panel2 = '#232C37'; Card = '#212A35'; Btn = '#2E3846'; Hover = '#263140'; Text = '#E8EEF5'; Sub = '#A9B6C6'; Muted = '#77869A'; ChipText = '#D3DCE8'; Thumb = '#455063'; IsDark = $true }
+    Haunted  = @{ Bg = '#0F0A18'; Panel = '#1A1126'; Panel2 = '#241A33'; Card = '#2A1D3D'; Btn = '#3A2754'; Hover = '#2F2145'; Text = '#F6EFFF'; Sub = '#BDAAD6'; Muted = '#8F7BAB'; ChipText = '#E6DAF5'; Thumb = '#5B4380'; IsDark = $true }
     Light    = @{ Bg = '#F1F1F5'; Panel = '#FFFFFF'; Panel2 = '#FFFFFF'; Card = '#E4E4EA'; Btn = '#D9D9E0'; Hover = '#E8E8EE'; Text = '#1B1B1D'; Sub = '#55555C'; Muted = '#7B7B84'; ChipText = '#33333A'; Thumb = '#B5B5BC'; IsDark = $false }
 }
 $Accents = '#60CDFF', '#7C83FF', '#C77DFF', '#FF6B9D', '#FF8A4C', '#FFC83D', '#3DDC97', '#2DD4BF'
@@ -599,19 +687,24 @@ function Set-TitleBar {
     [void][Dwm]::DwmSetWindowAttribute($h, 35, [ref]$c, 4)
 }
 function Apply-Theme {
-    $tn = "$($script:cfg['ui:theme'])"; if (-not $Themes.ContainsKey($tn)) { $tn = 'Dark' }
+    $script:hw = "$($script:cfg['ui:halloween'])" -ne 'Off'; $script:hwSound = "$($script:cfg['ui:hwsound'])" -ne 'Off'
+    $tn = "$($script:cfg['ui:theme'])"; if (-not $Themes.ContainsKey($tn) -or $tn -eq 'Haunted') { $tn = 'Dark' }
+    if ($script:hw) { $tn = 'Haunted' }
     $t = $Themes[$tn]
     $acc = "$($script:cfg['ui:accent'])"; if ($acc -notmatch '^#[0-9A-Fa-f]{6}$') { $acc = '#60CDFF' }
+    if ($script:hw) { $acc = '#FF7A1A' }
     $r = $app.Resources
     foreach ($k in 'Text', 'Sub', 'Muted', 'ChipText', 'Thumb', 'Card', 'Btn', 'Hover', 'Panel', 'Panel2') { Set-Res "Ui$k" (New-Brush $t[$k]) }
     Set-Res 'UiAccent' (New-Brush $acc)
     $c = [Windows.Media.ColorConverter]::ConvertFromString($acc)
     Set-Res 'UiAccentFg' (New-Brush $(if ((0.299 * $c.R + 0.587 * $c.G + 0.114 * $c.B) -gt 150) { '#101010' } else { '#FFFFFF' }))
-    if ("$($script:cfg['ui:bg'])" -eq 'Glow') {
+    if ($script:hw -or "$($script:cfg['ui:bg'])" -eq 'Glow') {
         $gb = [Windows.Media.LinearGradientBrush]::new(); $gb.StartPoint = [Windows.Point]::new(0, 0); $gb.EndPoint = [Windows.Point]::new(1, 1)
         $f = if ($t.IsDark) { 0.22 } else { 0.14 }
-        [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop (Mix $t.Bg $acc $f), 0.0))
+        $c0 = if ($script:hw) { Mix $t.Bg '#7A2BD8' 0.32 } else { Mix $t.Bg $acc $f }
+        [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop $c0, 0.0))
         [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.ColorConverter]::ConvertFromString($t.Bg)), 0.62))
+        if ($script:hw) { [void]$gb.GradientStops.Add((New-Object Windows.Media.GradientStop (Mix $t.Bg '#FF7A1A' 0.1), 1.0)) }
         if ("$($script:cfg['ui:anim'])" -ne 'Off') {
             $sw = New-Object Windows.Media.Animation.DoubleAnimation 0.5, 0.88, (New-Object Windows.Duration ([TimeSpan]::FromSeconds(8)))
             $sw.AutoReverse = $true; $sw.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
@@ -623,11 +716,14 @@ function Apply-Theme {
     } else { Set-Res 'UiWinBg' (New-Brush $t.Bg) }
     $sz = switch ("$($script:cfg['ui:size'])") { 'Small' { 180, 270 } 'Large' { 270, 405 } default { 224, 336 } }
     Set-Res 'UiPW' ([double]$sz[0]); Set-Res 'UiPH' ([double]$sz[1])
+    $lf = [double]$sz[0] / 224; Set-Res 'UiListScale' (New-Object Windows.Media.ScaleTransform -ArgumentList @($lf, $lf))
     $an = "$($script:cfg['ui:anim'])"; $script:animOn = $an -ne 'Off'; $script:animK = switch ($an) { 'Fast' { 0.6 } 'Relaxed' { 1.7 } default { 1.0 } }
     $rd = switch ("$($script:cfg['ui:round'])") { 'Sharp' { 4 } 'Round' { 18 } default { 10 } }
     Set-Res 'UiRad' ([double]$rd); Set-Res 'UiRadD' ([double]($rd + 2)); Set-Res 'UiRadB' ([Windows.CornerRadius]::new(0, 0, $rd, $rd)); Set-Res 'UiRadS' ([Windows.CornerRadius]::new($rd + 2))
     $script:themeBg = $t.Bg; $script:themeDark = [bool]$t.IsDark
+    if ($script:hw) { $ge = New-Object Windows.Media.Effects.DropShadowEffect; $ge.Color = [Windows.Media.ColorConverter]::ConvertFromString('#FF7A1A'); $ge.BlurRadius = 26; $ge.ShadowDepth = 0; $ge.Opacity = 0.75; $ge.Freeze(); Set-Res 'UiHoverGlow' $ge } else { Set-Res 'UiHoverGlow' $null }
     Set-TitleBar
+    if ($w) { Update-Halloween }
 }
 function Anim-Slide($el, $axis, $from, $ms = 350, $delay = 0) {
     if (-not $script:animOn) { $el.Opacity = 1; $el.RenderTransform = $null; return }
@@ -657,6 +753,7 @@ function Stagger-Detail {
 $app = [Windows.Application]::Current; if (-not $app) { $app = New-Object Windows.Application }
 $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
 <ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+ <x:Null x:Key="UiHoverGlow"/>
  <Style x:Key="Btn" TargetType="Button">
   <Setter Property="Foreground" Value="{DynamicResource UiText}"/><Setter Property="Background" Value="{DynamicResource UiBtn}"/><Setter Property="Padding" Value="14,10"/>
   <Setter Property="Cursor" Value="Hand"/><Setter Property="FontSize" Value="13.5"/><Setter Property="Margin" Value="0,0,0,8"/>
@@ -741,7 +838,7 @@ $app.Resources = [Windows.Markup.XamlReader]::Parse(@'
  </DataTrigger></Style.Triggers></Style>
  <ItemsPanelTemplate x:Key="PanelStack"><StackPanel/></ItemsPanelTemplate>
  <DataTemplate x:Key="TplList">
-  <Grid x:Name="row" Height="100" Margin="6,0"><Grid.RenderTransform><TranslateTransform/></Grid.RenderTransform>
+  <Grid x:Name="row" Height="100" Margin="6,0" LayoutTransform="{DynamicResource UiListScale}"><Grid.RenderTransform><TranslateTransform/></Grid.RenderTransform>
    <Grid.ColumnDefinitions><ColumnDefinition Width="82"/><ColumnDefinition Width="*"/><ColumnDefinition Width="130"/><ColumnDefinition Width="150"/><ColumnDefinition Width="54"/></Grid.ColumnDefinitions>
    <Grid Width="62" Height="88" HorizontalAlignment="Left">
     <Rectangle RadiusX="8" RadiusY="8" Fill="{Binding Accent}"/>
@@ -773,7 +870,18 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
   <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
   <Grid Margin="24,18,24,8">
    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="300"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
-   <TextBlock Text="Repack Shelf" FontSize="25" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,24,0"/>
+   <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,24,0">
+    <TextBlock Text="Repack Shelf" FontSize="25" FontWeight="SemiBold" VerticalAlignment="Center"/>
+    <Viewbox x:Name="hwPumpkin" Width="34" Height="34" Margin="10,0,0,0" Cursor="Hand" Visibility="Collapsed" ToolTip="Boo!"><Canvas Width="100" Height="100" Background="Transparent">
+     <Path Fill="#5E8C31" Data="M47,24 C47,14 52,8 61,6 L63,12 C57,14 55,18 55,26 Z"/>
+     <Ellipse Canvas.Left="6" Canvas.Top="22" Width="88" Height="70"><Ellipse.Fill><RadialGradientBrush GradientOrigin="0.4,0.35"><GradientStop Color="#FFB347" Offset="0"/><GradientStop Color="#F26A12" Offset="0.7"/><GradientStop Color="#C24A06" Offset="1"/></RadialGradientBrush></Ellipse.Fill></Ellipse>
+     <Ellipse Canvas.Left="20" Canvas.Top="22" Width="34" Height="70" Stroke="#B8400A" StrokeThickness="2.2" Opacity="0.7"/>
+     <Ellipse Canvas.Left="46" Canvas.Top="22" Width="34" Height="70" Stroke="#B8400A" StrokeThickness="2.2" Opacity="0.7"/>
+     <Path Fill="#FFE27A" Data="M24,50 L40,50 L32,36 Z"/>
+     <Path Fill="#FFE27A" Data="M60,50 L76,50 L68,36 Z"/>
+     <Path Fill="#FFE27A" Data="M26,64 L38,72 L45,64 L50,73 L55,64 L62,72 L74,64 L70,80 L30,80 Z"/>
+    </Canvas></Viewbox>
+   </StackPanel>
    <Border Grid.Column="1" Background="{DynamicResource UiCard}" CornerRadius="9" Padding="12,2">
     <Grid><TextBox x:Name="search" Background="Transparent" Foreground="{DynamicResource UiText}" CaretBrush="{DynamicResource UiText}" BorderThickness="0" FontSize="14" Padding="0,7"/>
      <TextBlock x:Name="ph" Text="Search games" Foreground="{DynamicResource UiMuted}" FontSize="14" IsHitTestVisible="False" VerticalAlignment="Center"/>
@@ -839,6 +947,7 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
       </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
      </Grid>
      <DataTemplate.Triggers><DataTrigger Binding="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=IsMouseOver}" Value="True">
+      <Setter TargetName="card" Property="Effect" Value="{DynamicResource UiHoverGlow}"/>
       <DataTrigger.EnterActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="card" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1.04" Duration="0:0:0.2"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation><DoubleAnimation Storyboard.TargetName="card" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1.04" Duration="0:0:0.2"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation><DoubleAnimation Storyboard.TargetName="shine" Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.X)" From="-120" To="340" Duration="0:0:0.75"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></DataTrigger.EnterActions>
       <DataTrigger.ExitActions><BeginStoryboard><Storyboard><DoubleAnimation Storyboard.TargetName="card" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleX)" To="1" Duration="0:0:0.24"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation><DoubleAnimation Storyboard.TargetName="card" Storyboard.TargetProperty="(UIElement.RenderTransform).(ScaleTransform.ScaleY)" To="1" Duration="0:0:0.24"><DoubleAnimation.EasingFunction><CubicEase EasingMode="EaseOut"/></DoubleAnimation.EasingFunction></DoubleAnimation></Storyboard></BeginStoryboard></DataTrigger.ExitActions>
      </DataTrigger></DataTemplate.Triggers></DataTemplate></ListBox.ItemTemplate>
@@ -846,6 +955,13 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
    <Border Grid.Column="1" Background="{DynamicResource UiPanel}" CornerRadius="14,0,0,0" Padding="26,26,26,16">
     <Grid>
      <TextBlock x:Name="empty" Text="Select a game" Foreground="{DynamicResource UiMuted}" FontSize="16" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+     <Canvas x:Name="hwGhost" Width="80" Height="96" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,0,0,150" Cursor="Hand" Opacity="0" IsHitTestVisible="False" Visibility="{Binding Visibility, ElementName=empty}" RenderTransformOrigin="0.5,0.5">
+      <Canvas.Effect><DropShadowEffect Color="#B58CFF" BlurRadius="26" ShadowDepth="0" Opacity="0.55"/></Canvas.Effect>
+      <Path Fill="#F4ECFF" Opacity="0.95" Data="M6,88 L6,40 C6,6 74,6 74,40 L74,88 L63,78 L52,88 L40,78 L29,88 L17,78 Z"/>
+      <Ellipse Canvas.Left="25" Canvas.Top="34" Width="9" Height="13" Fill="#2A1A3A"/>
+      <Ellipse Canvas.Left="46" Canvas.Top="34" Width="9" Height="13" Fill="#2A1A3A"/>
+      <Ellipse Canvas.Left="33" Canvas.Top="54" Width="14" Height="18" Fill="#2A1A3A" Opacity="0.85"/>
+     </Canvas>
      <ScrollViewer x:Name="detail" Visibility="Collapsed" VerticalScrollBarVisibility="Auto"><StackPanel>
       <Grid Width="200" Height="300" Margin="0,0,0,16">
        <Rectangle RadiusX="{DynamicResource UiRadD}" RadiusY="{DynamicResource UiRadD}" Fill="{Binding Accent}"/><TextBlock Text="{Binding Letter}" FontSize="96" FontWeight="Bold" Foreground="#33FFFFFF" HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-50,0,0"/><Image Source="{Binding Icon}" Width="64" Height="64" Margin="0,80,0,0"/>
@@ -869,8 +985,6 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
          <Button x:Name="btnExe" Content="Set .exe" Style="{StaticResource Btn}"/>
          <Button x:Name="btnFind" Content="Find cover online..." Style="{StaticResource Btn}"/>
          <Button x:Name="btnCover" Content="Set cover image" Style="{StaticResource Btn}"/>
-         <Button x:Name="btnSaves" Content="Back up saves" Style="{StaticResource Btn}"/>
-      <Button x:Name="btnRestore" Content="Restore saved games" Style="{StaticResource Btn}" Visibility="Collapsed"/>
       <Button x:Name="btnUn" Content="Uninstall completely" Style="{StaticResource Btn}" Background="#C42B1C"/>
         </StackPanel></Border></Popup>
      </StackPanel></ScrollViewer>
@@ -887,7 +1001,7 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
    <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
     <Grid><TextBlock Text="Settings" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="btnCloseSet" Content="Close" Style="{StaticResource Btn}" HorizontalAlignment="Right" Padding="14,6" Margin="0"/></Grid>
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,18,0,0"><StackPanel>
-     <TextBlock Text="LIBRARY" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><Button x:Name="btnFold" Content="Game folders..." Style="{StaticResource Btn}" Margin="0,8,0,8"/><Button x:Name="btnStor" Content="Storage dashboard..." Style="{StaticResource Btn}" Margin="0,0,0,8"/><Button x:Name="btnUpdate" Content="Check for app updates" Style="{StaticResource Btn}" Margin="0,0,0,20"/><TextBlock Text="THEME" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optTheme" Margin="0,8,0,20"><RadioButton Content="Dark" Tag="Dark" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Midnight" Tag="Midnight" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Slate" Tag="Slate" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Light" Tag="Light" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ACCENT COLOUR" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/>
+     <TextBlock Text="LIBRARY" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><Button x:Name="btnFold" Content="Game folders..." Style="{StaticResource Btn}" Margin="0,8,0,8"/><Button x:Name="btnStor" Content="Storage dashboard..." Style="{StaticResource Btn}" Margin="0,0,0,8"/><Button x:Name="btnUpdate" Content="Check for app updates" Style="{StaticResource Btn}" Margin="0,0,0,20"/><TextBlock Text="HALLOWEEN" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optHw" Margin="0,8,0,6"><RadioButton Content="On" Tag="On" GroupName="hw" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Off" Tag="Off" GroupName="hw" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="Haunted colours, embers, bats, a spider and a ghost. Overrides the theme and accent while on; Off restores your own look." FontSize="11.5" TextWrapping="Wrap" Foreground="{DynamicResource UiMuted}" Margin="0,0,0,14"/><TextBlock Text="SPOOKY SOUNDS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optHwSound" Margin="0,8,0,20"><RadioButton Content="On" Tag="On" GroupName="hs" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Off" Tag="Off" GroupName="hs" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="THEME" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optTheme" Margin="0,8,0,20"><RadioButton Content="Dark" Tag="Dark" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Midnight" Tag="Midnight" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Slate" Tag="Slate" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Light" Tag="Light" GroupName="th" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ACCENT COLOUR" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/>
      <WrapPanel x:Name="swatches" Margin="0,8,0,4"/>
      <StackPanel Orientation="Horizontal" Margin="0,0,0,20"><Border Background="{DynamicResource UiCard}" CornerRadius="8" Padding="10,2" Margin="0,0,8,0"><TextBox x:Name="hexBox" Width="96" Background="Transparent" Foreground="{DynamicResource UiText}" CaretBrush="{DynamicResource UiText}" BorderThickness="0" Padding="0,6" FontSize="13"/></Border><Button x:Name="btnHex" Content="Apply" Style="{StaticResource Btn}" Padding="14,7" Margin="0"/></StackPanel>
      <TextBlock Text="POSTER SIZE" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optSize" Margin="0,8,0,20"><RadioButton Content="Small" Tag="Small" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Medium" Tag="Medium" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Large" Tag="Large" GroupName="ps" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="BACKGROUND" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optBg" Margin="0,8,0,20"><RadioButton Content="Solid" Tag="Solid" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Glow" Tag="Glow" GroupName="bg" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="CORNERS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optRound" Margin="0,8,0,20"><RadioButton Content="Sharp" Tag="Sharp" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Soft" Tag="Soft" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Round" Tag="Round" GroupName="rd" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ANIMATION SPEED" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optAnim" Margin="0,8,0,20"><RadioButton Content="Off" Tag="Off" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Fast" Tag="Fast" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Normal" Tag="Normal" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Relaxed" Tag="Relaxed" GroupName="an" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="ONLINE LOOKUPS" FontSize="11.5" FontWeight="SemiBold" Foreground="{DynamicResource UiMuted}"/><WrapPanel x:Name="optOnline" Margin="0,8,0,6"><RadioButton Content="On" Tag="On" GroupName="ol" Style="{StaticResource Chip}" Margin="0,0,6,8"/><RadioButton Content="Off" Tag="Off" GroupName="ol" Style="{StaticResource Chip}" Margin="0,0,6,8"/></WrapPanel><TextBlock Text="Covers, genres and patch notes send game names or Steam IDs to Steam and SteamSpy. Turn off to keep everything local." FontSize="11.5" TextWrapping="Wrap" Foreground="{DynamicResource UiMuted}" Margin="0,0,0,20"/>
@@ -897,15 +1011,230 @@ $w = try { [Windows.Markup.XamlReader]::Parse(@'
    <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
     <Grid><TextBlock Text="Storage" FontSize="21" FontWeight="SemiBold" VerticalAlignment="Center"/><Button x:Name="btnCloseStor" Content="Close" Style="{StaticResource Btn}" HorizontalAlignment="Right" Padding="14,6" Margin="0"/></Grid>
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" Margin="0,18,0,0"><StackPanel x:Name="storBody"/></ScrollViewer></Grid></Border>
+  <Grid x:Name="hwLayer" Grid.RowSpan="3" IsHitTestVisible="False" ClipToBounds="True" Visibility="Collapsed">
+   <Canvas x:Name="hwDyn"/>
+   <Canvas x:Name="hwStatic">
+    <Path Canvas.Right="0" Canvas.Top="0" Width="90" Height="90" Stroke="#FFFFFF" StrokeThickness="0.9" Opacity="0.2" StrokeLineJoin="Round"
+     Data="M90,0 L0,0 M90,0 L6.8,34.4 M90,0 L26.4,63.6 M90,0 L55.6,83.2 M90,0 L90,90 M60,0 Q64.1,5.2 62.3,11.5 Q68.1,14.7 68.8,21.2 Q75.3,22 78.5,27.7 Q84.9,25.9 90,30 M35,0 Q42.5,9.4 39.2,21 Q49.8,26.9 51.1,38.9 Q63.1,40.2 69,50.8 Q80.6,47.5 90,55 M10,0 Q21,13.7 16.1,30.6 Q31.5,39.1 33.4,56.6 Q50.9,58.5 59.4,73.9 Q76.3,69 90,80"/>
+    <Canvas x:Name="hwSpider" Canvas.Right="46" Canvas.Top="0" Width="24" Height="40">
+     <Line X1="12" Y1="-400" X2="12" Y2="14" Stroke="#99D8C8F0" StrokeThickness="0.9"/>
+     <Path Data="M12,18 L3,11 L0,14 M12,18 L2,17 L-1,21 M12,18 L3,23 L1,28 M12,18 L21,11 L24,14 M12,18 L22,17 L25,21 M12,18 L21,23 L23,28" Stroke="#9F7AEA" StrokeThickness="1.1" StrokeLineJoin="Round"/>
+     <Ellipse Canvas.Left="6" Canvas.Top="13" Width="12" Height="14" Fill="#2B1B42" Stroke="#9F7AEA" StrokeThickness="0.9"/>
+     <Ellipse Canvas.Left="8.5" Canvas.Top="8" Width="7" Height="7" Fill="#2B1B42" Stroke="#9F7AEA" StrokeThickness="0.9"/>
+     <Ellipse Canvas.Left="9.2" Canvas.Top="10" Width="2" Height="2" Fill="#FF3B3B"/><Ellipse Canvas.Left="12.8" Canvas.Top="10" Width="2" Height="2" Fill="#FF3B3B"/>
+    </Canvas>
+   </Canvas>
+  </Grid>
+  <Rectangle x:Name="hwFlash" Grid.RowSpan="3" Fill="#E6DCFF" Opacity="0" IsHitTestVisible="False"/>
   <ProgressBar x:Name="busy" Grid.Row="2" Height="3" VerticalAlignment="Top" IsIndeterminate="True" Background="Transparent" BorderThickness="0" Foreground="{DynamicResource UiAccent}" Visibility="Collapsed"/>
   <TextBlock x:Name="status" Grid.Row="2" Foreground="{DynamicResource UiMuted}" FontSize="12" Margin="26,6,0,10"/>
  </Grid>
 </Window>
 '@) } catch { $e = $_.Exception; while ($e.InnerException) { $e = $e.InnerException }; [void][Windows.MessageBox]::Show("Window XAML failed:`n`n$($e.Message)", 'Repack Shelf', 'OK', 'Error'); exit 1 }
 $w.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'UiWinBg'); $w.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'UiText')
-foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','btnSaves','btnRestore','busy','btnUpdate','btnStor','storage','storBody','btnCloseStor','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','sortChips','viewChips','favChip','updChip','genreBtn','genrePop','genreClear','catChips','btnMore','morePop','btnSeen','btnNotes','optRound','optOnline','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
+foreach ($n in 'optHw','optHwSound','hwLayer','hwDyn','hwStatic','hwSpider','hwFlash','hwPumpkin','hwGhost') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
+foreach ($n in 'search','ph','chips','count','btnFold','btnScan','list','empty','detail','btnPlay','btnFolder','btnExe','btnCover','btnFind','busy','btnUpdate','btnStor','storage','storBody','btnCloseStor','updBar','updTitle','updSub','btnUpd','btnLater','btnCustom','settings','btnCloseSet','optTheme','optSize','optBg','optAnim','swatches','hexBox','btnHex','btnReset','sortChips','viewChips','favChip','updChip','genreBtn','genrePop','genreClear','catChips','btnMore','morePop','btnSeen','btnNotes','optRound','optOnline','btnUn','status') { Set-Variable -Name $n -Value $w.FindName($n) -Scope Script }
+# The window icon is drawn in code, so the title bar and taskbar always show it (even if the exe's own icon is stale or missing).
+function New-AppIcon {
+    $dv = New-Object Windows.Media.DrawingVisual
+    $dc = $dv.RenderOpen()
+    $grad = New-Object Windows.Media.LinearGradientBrush -ArgumentList @([Windows.Media.Color]::FromRgb(96, 205, 255), [Windows.Media.Color]::FromRgb(123, 92, 255), [double]45)
+    $dc.DrawRoundedRectangle($grad, $null, [Windows.Rect]::new(8, 8, 240, 240), 56, 56)
+    $tf = New-Object Windows.Media.Typeface -ArgumentList @('Segoe UI Semibold')
+    $ft = New-Object Windows.Media.FormattedText -ArgumentList @('R', [Globalization.CultureInfo]::InvariantCulture, [Windows.FlowDirection]::LeftToRight, $tf, [double]150, [Windows.Media.Brushes]::White)
+    $dc.DrawText($ft, [Windows.Point]::new((256 - $ft.Width) / 2, (256 - $ft.Height) / 2))
+    $dc.Close()
+    $rtb = New-Object Windows.Media.Imaging.RenderTargetBitmap -ArgumentList @(256, 256, 96, 96, [Windows.Media.PixelFormats]::Pbgra32)
+    $rtb.Render($dv); $rtb.Freeze(); $rtb
+}
+# Which icon the window uses: your own file first (running the script from the repo), then nothing at all when running the
+# compiled exe (Windows then uses the icon built into the exe), and the drawn "R" only as a last resort.
+function Get-AppIcon {
+    $self = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $compiled = ($self -match '(?i)\.exe$') -and ($self -notmatch '(?i)\\(powershell|pwsh|powershell_ise)\.exe$')
+    if ($compiled) { return $null }
+    $cands = @()
+    if ($PSScriptRoot) { $cands += (Join-Path $PSScriptRoot '..\build\RepackShelf.ico'); $cands += (Join-Path $PSScriptRoot 'RepackShelf.ico'); $cands += (Join-Path $PSScriptRoot 'build\RepackShelf.ico') }
+    foreach ($c in $cands) {
+        if (Test-Path -LiteralPath $c) {
+            try {
+                $dec = [Windows.Media.Imaging.BitmapDecoder]::Create([Uri]([IO.Path]::GetFullPath($c)), [Windows.Media.Imaging.BitmapCreateOptions]::None, [Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+                $f = $dec.Frames | Sort-Object PixelWidth -Descending | Select-Object -First 1
+                if ($f) { return $f }
+            } catch { Write-Log "Could not read icon $c : $($_.Exception.Message)" }
+        }
+    }
+    New-AppIcon
+}
+try { $ic = Get-AppIcon; if ($ic) { $w.Icon = $ic } } catch { Write-Log "Window icon failed: $($_.Exception.Message)" }
 $w.Title = if ($AppVersion.StartsWith('__')) { 'Repack Shelf (dev build)' } else { "Repack Shelf v$AppVersion" }
 $script:filter = 'All'; $script:games = @(); $script:byKey = @{}
+
+# ---------- halloween ----------
+$script:rnd = New-Object Random; $script:hwBats = @(); $script:sfxReady = $false; $script:sfxDead = $false; $script:hwHover = $null
+$script:hwNextBat = (Get-Date).AddSeconds(7); $script:hwNextSpider = (Get-Date).AddSeconds(16)
+$script:batGeo = [Windows.Media.Geometry]::Parse('M50,22 L54,14 L56,24 C62,18 74,16 98,22 C90,26 88,32 86,40 C80,34 74,34 70,42 C66,38 60,40 56,48 L50,58 L44,48 C40,40 34,38 30,42 C26,34 20,34 14,40 C12,32 10,26 2,22 C26,16 38,18 44,24 L46,14 Z')
+function Play-Sfx($n) {
+    if (-not ($script:hw -and $script:hwSound) -or $script:sfxDead) { return }
+    try { if (-not $script:sfxReady) { $mv = 0.0; if ([double]::TryParse("$($script:cfg['ui:hwvol'])", [ref]$mv) -and $mv -gt 0 -and $mv -le 1) { [RsSfx]::Master = $mv }; [RsSfx]::Init(); $script:sfxReady = $true }; [RsSfx]::Play($n) }
+    catch { $script:sfxDead = $true; Write-Log "Sound effects disabled: $($_.Exception.Message)" }
+}
+function New-Dbl($from, $to, $sec, $rev = $false, $forever = $true) {
+    $a = New-Object Windows.Media.Animation.DoubleAnimation ([double]$from), ([double]$to), (New-Object Windows.Duration ([TimeSpan]::FromSeconds($sec)))
+    $a.AutoReverse = $rev; if ($forever) { $a.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever }
+    [Windows.Media.Animation.Timeline]::SetDesiredFrameRate($a, 30)
+    $a
+}
+function New-Keys($pairs, $pct = $true) {
+    $ka = New-Object Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+    foreach ($p in $pairs) {
+        $kt = if ($pct) { [Windows.Media.Animation.KeyTime]::FromPercent([double]$p[0]) } else { [Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromSeconds([double]$p[0])) }
+        $kf = New-Object Windows.Media.Animation.LinearDoubleKeyFrame -ArgumentList @([double]$p[1], $kt)
+        [void]$ka.KeyFrames.Add($kf)
+    }
+    $ka
+}
+function Flash-Lightning {
+    if (-not ($script:hw -and $script:animOn)) { return }
+    $a = New-Keys @(@(0, 0.0), @(0.04, 0.28), @(0.1, 0.06), @(0.16, 0.22), @(0.7, 0.0)) $false
+    $hwFlash.BeginAnimation([Windows.UIElement]::OpacityProperty, $a)
+}
+function Build-Ambient {
+    $hwDyn.Children.Clear(); $script:hwBats = @()
+    if (-not ($script:hw -and $script:animOn)) { return }
+    $cw = [Math]::Max($hwLayer.ActualWidth, 600); $ch = [Math]::Max($hwLayer.ActualHeight, 400)
+    # drifting fog banks
+    for ($i = 0; $i -lt 3; $i++) {
+        $e = New-Object Windows.Shapes.Ellipse; $e.Width = 560; $e.Height = 220; $e.IsHitTestVisible = $false
+        $rg = New-Object Windows.Media.RadialGradientBrush
+        [void]$rg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.Color]::FromArgb(46, 150, 95, 255)), 0.0))
+        [void]$rg.GradientStops.Add((New-Object Windows.Media.GradientStop ([Windows.Media.Color]::FromArgb(0, 150, 95, 255)), 1.0))
+        $rg.Freeze(); $e.Fill = $rg
+        [Windows.Controls.Canvas]::SetTop($e, $ch - 150 - $i * 55 + $script:rnd.Next(-20, 20)); [Windows.Controls.Canvas]::SetLeft($e, 0)
+        $fa = New-Dbl (-320 + $i * 140) ($cw - 240 - $i * 120) (46 + $i * 13) $true
+        $fa.EasingFunction = New-Object Windows.Media.Animation.SineEase
+        $e.BeginAnimation([Windows.Controls.Canvas]::LeftProperty, $fa)
+        [void]$hwDyn.Children.Add($e)
+    }
+    # rising embers
+    for ($i = 0; $i -lt 26; $i++) {
+        $sz = 2 + $script:rnd.NextDouble() * 3
+        $e = New-Object Windows.Shapes.Ellipse; $e.Width = $sz; $e.Height = $sz; $e.IsHitTestVisible = $false; $e.Opacity = 0
+        $e.Fill = New-Brush $(if ($script:rnd.Next(3) -eq 0) { '#FFD36A' } else { '#FF7A1A' })
+        [Windows.Controls.Canvas]::SetLeft($e, $script:rnd.NextDouble() * $cw); [Windows.Controls.Canvas]::SetTop($e, 0)
+        $tt = New-Object Windows.Media.TranslateTransform; $e.RenderTransform = $tt
+        $dur = 9 + $script:rnd.NextDouble() * 9; $off = [TimeSpan]::FromSeconds(-$script:rnd.NextDouble() * $dur)
+        $ry = New-Dbl ($ch + 10) (-20) $dur $false; $ry.BeginTime = $off
+        $sx = New-Dbl (-25) 25 ($dur / 2.2) $true
+        $oa = New-Keys @(@(0, 0.0), @(0.18, 0.9), @(0.75, 0.7), @(1, 0.0)); $oa.Duration = New-Object Windows.Duration ([TimeSpan]::FromSeconds($dur)); $oa.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever; $oa.BeginTime = $off
+        $tt.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $ry)
+        $tt.BeginAnimation([Windows.Media.TranslateTransform]::XProperty, $sx)
+        $e.BeginAnimation([Windows.UIElement]::OpacityProperty, $oa)
+        [void]$hwDyn.Children.Add($e)
+    }
+}
+function Fly-Bats {
+    if (-not ($script:hw -and $script:animOn)) { return }
+    $cw = [Math]::Max($hwLayer.ActualWidth, 600); $ch = [Math]::Max($hwLayer.ActualHeight, 400)
+    $count = $script:rnd.Next(1, 4); $dir = if ($script:rnd.Next(2) -eq 0) { 1.0 } else { -1.0 }
+    $baseY = 50 + $script:rnd.NextDouble() * $ch * 0.35; $dur = 5.5 + $script:rnd.NextDouble() * 2.5
+    Play-Sfx 'bat'
+    for ($i = 0; $i -lt $count; $i++) {
+        $p = New-Object Windows.Shapes.Path; $p.Data = $script:batGeo; $p.Stretch = 'Fill'; $p.IsHitTestVisible = $false
+        $p.Width = 34 + $script:rnd.NextDouble() * 30; $p.Height = $p.Width * 0.6
+        $p.Fill = New-Brush '#14091F'; $p.Stroke = New-Brush '#8A63D2'; $p.StrokeThickness = 0.8; $p.Opacity = 0.9
+        $p.RenderTransformOrigin = [Windows.Point]::new(0.5, 0.4)
+        $st = New-Object Windows.Media.ScaleTransform -ArgumentList @($dir, 1.0); $p.RenderTransform = $st
+        $delay = [TimeSpan]::FromMilliseconds($i * 450 + $script:rnd.Next(0, 200))
+        $x0 = if ($dir -gt 0) { -120.0 } else { $cw + 120.0 }; $x1 = if ($dir -gt 0) { $cw + 120.0 } else { -120.0 }
+        $ax = New-Dbl $x0 $x1 $dur $false $false; $ax.BeginTime = $delay
+        $y0 = $baseY + $i * 26
+        $ay = New-Object Windows.Media.Animation.DoubleAnimationUsingKeyFrames; $ay.BeginTime = $delay
+        $pcts = @(0, 0.2, 0.4, 0.6, 0.8, 1.0); $offs = @(0, -40, 30, -30, 25, -10)
+        for ($k = 0; $k -lt $pcts.Count; $k++) {
+            $kf = New-Object Windows.Media.Animation.EasingDoubleKeyFrame -ArgumentList @(([double]($y0 + $offs[$k])), [Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromSeconds($dur * $pcts[$k])))
+            $kf.EasingFunction = New-Object Windows.Media.Animation.SineEase; [void]$ay.KeyFrames.Add($kf)
+        }
+        $fl = New-Dbl 1 0.35 0.11 $true; $fl.BeginTime = [TimeSpan]::FromMilliseconds($script:rnd.Next(0, 100))
+        [Windows.Controls.Canvas]::SetLeft($p, $x0); [Windows.Controls.Canvas]::SetTop($p, $y0)
+        [void]$hwDyn.Children.Add($p)
+        $p.BeginAnimation([Windows.Controls.Canvas]::LeftProperty, $ax)
+        $p.BeginAnimation([Windows.Controls.Canvas]::TopProperty, $ay)
+        $st.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, $fl)
+        $script:hwBats += [pscustomobject]@{ El = $p; End = (Get-Date).AddSeconds($dur + 2 + $count * 0.6) }
+    }
+}
+function Drop-Spider {
+    if (-not ($script:hw -and $script:animOn)) { return }
+    $ka = New-Object Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+    $cin = New-Object Windows.Media.Animation.CubicEase; $cin.EasingMode = 'EaseIn'; $cout = New-Object Windows.Media.Animation.CubicEase; $cout.EasingMode = 'EaseOut'
+    $pts = @(@(0, -90, $null), @(1.4, 105, $cout), @(3.2, 105, $null), @(4.8, -90, $cin))
+    foreach ($q in $pts) {
+        $kf = New-Object Windows.Media.Animation.EasingDoubleKeyFrame -ArgumentList @([double]$q[1], [Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromSeconds($q[0])))
+        if ($q[2]) { $kf.EasingFunction = $q[2] }; [void]$ka.KeyFrames.Add($kf)
+    }
+    $hwSpider.RenderTransform.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $ka)
+    Play-Sfx 'spider'
+}
+$script:hwTimer = New-Object Windows.Threading.DispatcherTimer; $script:hwTimer.Interval = [TimeSpan]::FromSeconds(1)
+$script:hwTimer.Add_Tick({
+    if (-not ($script:hw -and $script:animOn)) { return }
+    $now = Get-Date
+    $dead = @($script:hwBats | Where-Object { $_.End -lt $now })
+    if ($dead.Count) { foreach ($d in $dead) { $hwDyn.Children.Remove($d.El) }; $script:hwBats = @($script:hwBats | Where-Object { $_.End -ge $now }) }
+    if ($now -ge $script:hwNextBat) { Fly-Bats; $script:hwNextBat = $now.AddSeconds(18 + $script:rnd.NextDouble() * 30) }
+    if ($now -ge $script:hwNextSpider) { Drop-Spider; $script:hwNextSpider = $now.AddSeconds(35 + $script:rnd.NextDouble() * 50) }
+})
+$script:hwResize = New-Object Windows.Threading.DispatcherTimer; $script:hwResize.Interval = [TimeSpan]::FromMilliseconds(500)
+$script:hwResize.Add_Tick({ $script:hwResize.Stop(); Build-Ambient })
+function Update-Halloween {
+    if (-not $hwLayer) { return }
+    $on = [bool]$script:hw; $fx = $on -and $script:animOn
+    $hwLayer.Visibility = if ($on) { 'Visible' } else { 'Collapsed' }
+    $hwPumpkin.Visibility = if ($on) { 'Visible' } else { 'Collapsed' }
+    $hwGhost.Opacity = if ($on) { 1 } else { 0 }; $hwGhost.IsHitTestVisible = $on
+    if ("$($empty.Text)" -like 'Select a game*') { $empty.Text = if ($on) { 'Select a game... if you dare' } else { 'Select a game' } }
+    # ghost: gentle float
+    if (-not ($hwGhost.RenderTransform -is [Windows.Media.TransformGroup])) {
+        $tg = New-Object Windows.Media.TransformGroup; $script:ghostS = New-Object Windows.Media.ScaleTransform; $script:ghostT = New-Object Windows.Media.TranslateTransform
+        [void]$tg.Children.Add($script:ghostS); [void]$tg.Children.Add($script:ghostT); $hwGhost.RenderTransform = $tg
+    }
+    if ($fx) {
+        $fy = New-Dbl (-9) 9 2.4 $true; $fy.EasingFunction = New-Object Windows.Media.Animation.SineEase
+        $script:ghostT.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $fy)
+    } else { $script:ghostT.BeginAnimation([Windows.Media.TranslateTransform]::YProperty, $null) }
+    # pumpkin: candle flicker
+    if ($on) {
+        $pe = New-Object Windows.Media.Effects.DropShadowEffect; $pe.Color = [Windows.Media.ColorConverter]::ConvertFromString('#FF7A1A'); $pe.BlurRadius = 20; $pe.ShadowDepth = 0; $pe.Opacity = 0.8
+        $hwPumpkin.Effect = $pe
+        if ($fx) {
+            $fk = New-Keys @(@(0, 0.9), @(0.15, 0.5), @(0.3, 0.85), @(0.45, 0.4), @(0.6, 0.95), @(0.8, 0.6), @(1, 0.9))
+            $fk.Duration = New-Object Windows.Duration ([TimeSpan]::FromSeconds(2.6)); $fk.RepeatBehavior = [Windows.Media.Animation.RepeatBehavior]::Forever
+            [Windows.Media.Animation.Timeline]::SetDesiredFrameRate($fk, 30)
+            $pe.BeginAnimation([Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $fk)
+        }
+    } else { $hwPumpkin.Effect = $null }
+    $hwSpider.RenderTransform = New-Object Windows.Media.TranslateTransform 0, -90
+    if ($on) { $hwTimer.Start() } else { $hwTimer.Stop() }
+    Build-Ambient
+}
+$hwPumpkin.Add_MouseLeftButtonUp({ Play-Sfx 'thunder'; Flash-Lightning })
+$hwGhost.Add_MouseLeftButtonUp({
+    Play-Sfx 'ghost'
+    if ($script:animOn -and $script:ghostS) {
+        $pop = New-Dbl 1 1.3 0.16 $true $false
+        $script:ghostS.BeginAnimation([Windows.Media.ScaleTransform]::ScaleXProperty, $pop); $script:ghostS.BeginAnimation([Windows.Media.ScaleTransform]::ScaleYProperty, $pop)
+    }
+})
+$hwLayer.Add_SizeChanged({ if ($script:hw) { $script:hwResize.Stop(); $script:hwResize.Start() } })
+$list.Add_PreviewMouseMove({
+    if (-not ($script:hw -and $script:hwSound)) { return }
+    try {
+        $c = [Windows.Controls.ItemsControl]::ContainerFromElement($list, [Windows.DependencyObject]$args[1].OriginalSource)
+        if ($null -ne $c -and -not [object]::ReferenceEquals($c, $script:hwHover)) { Play-Sfx 'hover' }
+        $script:hwHover = $c
+    } catch {}
+})
 
 function Animate-In {
     if (-not $script:animOn) { return }
@@ -960,7 +1289,10 @@ function Scan-And-Show($full = $false) {
     $cj = @(); $sj = @(); $online = ("$($script:cfg['ui:online'])" -ne 'Off')
     foreach ($g in $script:games) {
         $c = Cache-Path $g.Key; $none = "$c.none"
-        if (-not $g.Size -or $g.Bytes -le 0 -or $full) { $sj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir } }
+        $szk = "szat:$($g.Key)"; $szAt = [long]("0" + [string]$script:cfg[$szk])
+        $stale = ([DateTime]::UtcNow.Ticks - $szAt) -gt [TimeSpan]::FromHours(12).Ticks
+        $recent = $g.DateTicks -gt 0 -and ([DateTime]::Now.Ticks - $g.DateTicks) -lt [TimeSpan]::FromDays(3).Ticks
+        if (-not $g.Size -or $g.Bytes -le 0 -or $full -or $script:forceSizes -or $stale -or $recent) { $sj += [pscustomobject]@{ Key = $g.Key; Dir = $g.Dir } }
         $needC = (-not (Test-Path $c)) -and -not ((Test-Path $none) -and ((Get-Item $none).LastWriteTime -gt (Get-Date).AddDays(-1)))
         $gk = "gen:$($g.Key)"; $needG = (-not $g.Genres) -and ("$($script:cfg[$gk])" -ne '-')
         if ($needC -or $needG) {
@@ -969,261 +1301,11 @@ function Scan-And-Show($full = $false) {
     }
     if ($cj -and $online) { Start-Bg $coverSb $cj }
     if ($sj) { Start-Bg $sizeSb $sj }
+    $script:forceSizes = $false
     Start-NewsCheck $full
     $status.Text = "Found $($script:games.Count) game(s). $(if ($cj -and $online) { 'Fetching cover art and genres in the background...' })"
     Save-Library
 }
-# ---------- keep saves when removing a game ----------
-$script:savesRoot = Join-Path $appDir 'saves'
-function Get-Slug($s) { (("$s").ToLower() -replace '[^a-z0-9]+', '-').Trim('-') }
-function Norm($s) { ("$s" -replace '[^a-zA-Z0-9]', '').ToLower() }
-function Get-BackupSlug($g) { $s = Get-Slug (Get-Term $g.Name); if (-not $s) { $s = 'game-' + (Get-Slug $g.Key) }; $s }
-function Get-LatestBackup($g) {
-    try {
-        $d = Join-Path $script:savesRoot (Get-BackupSlug $g)
-        if (-not (Test-Path -LiteralPath $d)) { return $null }
-        Get-ChildItem -LiteralPath $d -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending |
-            Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json') } | Select-Object -First 1 -ExpandProperty FullName
-    } catch { $null }
-}
-function Get-DirSizeCap($d, $cap) {
-    $s = 0L; $stack = New-Object 'System.Collections.Generic.Stack[string]'; $stack.Push($d)
-    while ($stack.Count) {
-        $cur = $stack.Pop()
-        try {
-            foreach ($f in [IO.Directory]::EnumerateFiles($cur)) { try { $s += ([IO.FileInfo]$f).Length } catch {} }
-            if ($s -gt $cap) { return -1 }
-            foreach ($x in [IO.Directory]::EnumerateDirectories($cur)) { if (([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push($x) } }
-        } catch {}
-    }
-    $s
-}
-# Copies a folder tree without following junctions/symlinks. Returns the number of files that could not be copied.
-function Copy-DirSafe($src, $dst) {
-    $fail = 0
-    $stack = New-Object 'System.Collections.Generic.Stack[object]'; $stack.Push([pscustomobject]@{ S = $src; D = $dst })
-    while ($stack.Count) {
-        $p = $stack.Pop()
-        try { [void][IO.Directory]::CreateDirectory($p.D) } catch { $fail++; continue }
-        try {
-            foreach ($f in [IO.Directory]::EnumerateFiles($p.S)) {
-                try { [IO.File]::Copy($f, (Join-Path $p.D ([IO.Path]::GetFileName($f))), $true) } catch { $fail++; Write-Log "Save copy failed: $f - $($_.Exception.Message)" }
-            }
-            foreach ($x in [IO.Directory]::EnumerateDirectories($p.S)) {
-                if (([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) -eq 0) { $stack.Push([pscustomobject]@{ S = $x; D = (Join-Path $p.D ([IO.Path]::GetFileName($x))) }) }
-            }
-        } catch { $fail++ }
-    }
-    $fail
-}
-function New-SaveCand($path, $kind, $rel, $label) {
-    $sz = Get-DirSizeCap $path 2GB
-    if ($sz -eq 0) { return $null }
-    $o = New-Object RsSave; $o.Location = $path; $o.Kind = $kind; $o.Rel = $rel; $o.Label = $label; $o.Bytes = $sz; $o.Checked = ($sz -gt 0)
-    $o
-}
-function Add-SaveCand($path, $kind, $rel, $label) {
-    $k = "$path".TrimEnd('\').ToLower()
-    if ($script:saveSeen[$k]) { return }
-    foreach ($e in @($script:saveSeen.Keys)) { if ($k.StartsWith("$e\") -or $e.StartsWith("$k\")) { return } }
-    $c = New-SaveCand $path $kind $rel $label
-    if ($c) { $script:saveSeen[$k] = 1; [void]$script:saveList.Add($c) }
-}
-function Test-NameMatch($n, $t, $eb) {
-    $x = Norm $n
-    if ($x.Length -lt 4) { return $false }
-    if ($t.Length -ge 4 -and ($x -eq $t -or ($t.Length -ge 6 -and $x.Length -ge 6 -and ($x.Contains($t) -or $t.Contains($x))))) { return $true }
-    if ($eb.Length -ge 5 -and $x -eq $eb) { return $true }
-    $false
-}
-# Looks in the places games usually keep saves: inside the game folder, Steam-emulator save folders (by App ID), and
-# folders under Documents / AppData / Saved Games whose name matches the game.
-function Find-SaveCandidates($g) {
-    $script:saveList = New-Object 'System.Collections.Generic.List[object]'; $script:saveSeen = @{}
-    # 1. save-like folders inside the game's own folder (these are lost when the folder is deleted)
-    if ($g.Dir -and (Test-Path -LiteralPath $g.Dir)) {
-        $root = "$($g.Dir)".TrimEnd('\')
-        $stack = New-Object 'System.Collections.Generic.Stack[object]'; $stack.Push([pscustomobject]@{ P = $root; L = 0 })
-        while ($stack.Count) {
-            $c = $stack.Pop()
-            try {
-                foreach ($x in [IO.Directory]::EnumerateDirectories($c.P)) {
-                    if (([IO.File]::GetAttributes($x) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-                    $nm = [IO.Path]::GetFileName($x)
-                    if ($nm -match '(?i)^(saves?|save[ _-]?games?|save[ _-]?data|profiles?|user[ _-]?data|player[ _-]?data)$') { Add-SaveCand $x 'gamedir' $x.Substring($root.Length).TrimStart('\') 'Inside the game folder' }
-                    elseif ($c.L -lt 3) { $stack.Push([pscustomobject]@{ P = $x; L = $c.L + 1 }) }
-                }
-            } catch {}
-        }
-    }
-    # 2. Steam-emulator save folders named after the Steam App ID
-    $k = "app:$($g.Key)"; $id = "$($script:cfg[$k])"
-    if ($id -match '^\d+$') {
-        $cand = @((Join-Path $env:PUBLIC "Documents\OnlineFix\$id"), (Join-Path $env:APPDATA "Goldberg SteamEmu Saves\$id"))
-        $sd = Join-Path $env:PUBLIC 'Documents\Steam'
-        if (Test-Path -LiteralPath $sd) { try { foreach ($x in [IO.Directory]::EnumerateDirectories($sd)) { $cand += (Join-Path $x $id) } } catch {} }
-        foreach ($c in $cand) { if (Test-Path -LiteralPath $c -PathType Container) { Add-SaveCand $c 'abs' $null "Save data for Steam App ID $id" } }
-    }
-    # 3. folders whose name matches the game, one or two levels below the usual save locations
-    $t = Norm (Get-Term $g.Name); $eb = if ($g.Exe) { Norm ([IO.Path]::GetFileNameWithoutExtension($g.Exe)) } else { '' }
-    $skip = @('microsoft', 'packages', 'temp', 'programs', 'nvidia', 'nvidiacorporation', 'intel', 'amd', 'google', 'mozilla', 'adobe', 'discord', 'steam', 'crashdumps', 'd3dscache', 'connecteddevicesplatform', 'publishers', 'history', 'comms', 'apps', 'onedrive')
-    $docs = [Environment]::GetFolderPath('MyDocuments')
-    $roots = @($docs, (Join-Path $docs 'My Games'), (Join-Path $env:USERPROFILE 'Saved Games'), $env:APPDATA, $env:LOCALAPPDATA, (Join-Path $env:USERPROFILE 'AppData\LocalLow'), (Join-Path $env:PUBLIC 'Documents'))
-    foreach ($r in ($roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique)) {
-        try {
-            foreach ($d1 in [IO.Directory]::EnumerateDirectories($r)) {
-                if (([IO.File]::GetAttributes($d1) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-                $n1 = [IO.Path]::GetFileName($d1)
-                if ($skip -contains (Norm $n1)) { continue }
-                if (Test-NameMatch $n1 $t $eb) { Add-SaveCand $d1 'abs' $null 'Folder named after the game'; continue }
-                try {
-                    foreach ($d2 in [IO.Directory]::EnumerateDirectories($d1)) {
-                        if (([IO.File]::GetAttributes($d2) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
-                        if (Test-NameMatch ([IO.Path]::GetFileName($d2)) $t $eb) { Add-SaveCand $d2 'abs' $null "Folder named after the game (in $n1)" }
-                    }
-                } catch {}
-            }
-        } catch {}
-    }
-    @($script:saveList)
-}
-function Test-RestoreTarget($dst, $g) {
-    try { $p = [IO.Path]::GetFullPath("$dst").TrimEnd('\') } catch { return $false }
-    if (-not (Test-LocalPath $p) -or $p.Length -le 3) { return $false }
-    $win = "$env:WINDIR".TrimEnd('\')
-    if ($p -ieq $win -or $p.StartsWith("$win\", [StringComparison]::OrdinalIgnoreCase)) { return $false }
-    $gd = if ($g.Dir) { "$($g.Dir)".TrimEnd('\') } else { '' }
-    $inGame = $gd -and $p.StartsWith("$gd\", [StringComparison]::OrdinalIgnoreCase)
-    if (-not $inGame) {
-        foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) { if ($pf -and ($p -ieq $pf.TrimEnd('\') -or $p.StartsWith($pf.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase))) { return $false } }
-    }
-    $ok = $inGame
-    foreach ($root in @($env:USERPROFILE, $env:PUBLIC, $env:ProgramData)) { if ($root -and $p.StartsWith("$($root.TrimEnd('\'))\", [StringComparison]::OrdinalIgnoreCase)) { $ok = $true } }
-    $ok
-}
-function Show-SaveDialog($g, $cands, $mode) {
-    $dlg = Parse-Xaml (@'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
- Title="Save games" Width="680" Height="500" WindowStartupLocation="CenterOwner" ShowInTaskbar="False" ResizeMode="NoResize" FontFamily="Segoe UI Variable Text, Segoe UI">
- <Grid Margin="24">
-  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
-  <StackPanel>
-   <TextBlock x:Name="dTitle" FontSize="20" FontWeight="SemiBold" TextWrapping="Wrap"/>
-   <TextBlock x:Name="dHint" Margin="0,6,0,14" FontSize="12.5" TextWrapping="Wrap" Foreground="{DynamicResource UiSub}"/>
-  </StackPanel>
-  <ListBox x:Name="dList" Grid.Row="1" Background="{DynamicResource UiCard}" Foreground="{DynamicResource UiText}" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-   <ListBox.ItemTemplate><DataTemplate>
-    <Grid Margin="6,7"><Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-     <CheckBox IsChecked="{Binding Checked, Mode=TwoWay}" VerticalAlignment="Top" Margin="0,3,12,0"/>
-     <StackPanel Grid.Column="1"><TextBlock Text="{Binding Label}" FontWeight="SemiBold"/><TextBlock Text="{Binding Location}" FontSize="11.5" TextTrimming="CharacterEllipsis" Foreground="{DynamicResource UiSub}"/><TextBlock Text="{Binding SizeText}" FontSize="11.5" Foreground="{DynamicResource UiMuted}"/></StackPanel>
-    </Grid></DataTemplate></ListBox.ItemTemplate>
-  </ListBox>
-  <Grid Grid.Row="2" Margin="0,16,0,0">
-   <Button x:Name="dAdd" Content="Add folder..." Style="{StaticResource Btn}" HorizontalAlignment="Left" Margin="0"/>
-   <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
-    <Button x:Name="dSkip" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
-    <Button x:Name="dCancel" Content="Cancel" Style="{StaticResource Btn}" Margin="0,0,8,0"/>
-    <Button x:Name="dGo" Style="{StaticResource Btn}" Background="{DynamicResource UiAccent}" Foreground="{DynamicResource UiAccentFg}" Margin="0"/>
-   </StackPanel>
-  </Grid>
- </Grid>
-</Window>
-'@)
-    $dlg.Owner = $w
-    $dlg.SetResourceReference([Windows.Controls.Control]::BackgroundProperty, 'UiPanel'); $dlg.SetResourceReference([Windows.Controls.Control]::ForegroundProperty, 'UiText')
-    $items = New-Object 'System.Collections.ObjectModel.ObservableCollection[object]'
-    foreach ($c in @($cands)) { $items.Add($c) }
-    $dlg.FindName('dList').ItemsSource = $items
-    $dlg.FindName('dTitle').Text = if ($mode -eq 'uninstall') { "Keep the saves for $($g.Name)?" } else { "Back up saves for $($g.Name)" }
-    $dlg.FindName('dHint').Text = "Tick the folders to keep. They are copied to $script:savesRoot and can be restored after you reinstall the game. Folders over 2 GB are unticked. If a save folder is missing from the list, use Add folder." + $(if ($items.Count -eq 0) { "`n`nNo save folders were found automatically." } else { '' })
-    $dlg.FindName('dGo').Content = if ($mode -eq 'uninstall') { 'Back up, then uninstall' } else { 'Back up selected' }
-    $skip = $dlg.FindName('dSkip'); $skip.Content = 'Uninstall without saves'; if ($mode -ne 'uninstall') { $skip.Visibility = 'Collapsed' }
-    $script:saveDlgWin = $dlg; $script:saveDlgItems = $items; $script:saveDlgResult = 'cancel'; $script:saveDlgGame = $g
-    $dlg.FindName('dGo').Add_Click({ $script:saveDlgResult = 'go'; $script:saveDlgWin.Close() })
-    $skip.Add_Click({ $script:saveDlgResult = 'skip'; $script:saveDlgWin.Close() })
-    $dlg.FindName('dCancel').Add_Click({ $script:saveDlgResult = 'cancel'; $script:saveDlgWin.Close() })
-    $dlg.FindName('dAdd').Add_Click({
-        $fb = New-Object System.Windows.Forms.FolderBrowserDialog; $fb.Description = 'Pick a save folder to keep'
-        if ($fb.ShowDialog() -eq 'OK') {
-            $sp = "$($fb.SelectedPath)"
-            if (-not (Test-LocalPath $sp) -or $sp.TrimEnd('\').Length -le 2) { Tell 'Pick a folder on a local drive, not a whole drive.'; return }
-            $c = New-SaveCand $sp 'abs' $null 'Added by you'
-            if ($c) { $script:saveDlgItems.Add($c) } else { Tell 'That folder is empty.' }
-        }
-    })
-    [void]$dlg.ShowDialog()
-    [pscustomobject]@{ Result = $script:saveDlgResult; Items = @($items | Where-Object { $_.Checked }) }
-}
-function Backup-Saves($g, $items) {
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $dest = Join-Path (Join-Path $script:savesRoot (Get-BackupSlug $g)) $stamp
-    [void][IO.Directory]::CreateDirectory($dest)
-    $w.Cursor = 'Wait'; $w.Dispatcher.Invoke([action]{}, 'Render')
-    $man = @(); $i = 0; $failed = 0
-    foreach ($it in $items) {
-        $failed += [int](Copy-DirSafe $it.Location (Join-Path $dest "$i"))
-        $man += [pscustomobject]@{ Kind = $it.Kind; Src = $it.Location; Rel = $it.Rel; Sub = "$i"; Label = $it.Label }
-        $i++
-    }
-    $k = "app:$($g.Key)"
-    Write-Atomic (Join-Path $dest 'manifest.json') ([pscustomobject]@{ v = 1; game = $g.Name; appId = "$($script:cfg[$k])"; created = (Get-Date).ToString('s'); items = $man } | ConvertTo-Json -Depth 4)
-    $w.Cursor = $null
-    Write-Log "Saves backed up for $($g.Name): $i folder(s), $failed failed -> $dest"
-    [pscustomobject]@{ Dest = $dest; Failed = $failed }
-}
-# Used by the uninstall button. Returns $false when the user cancels the whole uninstall.
-function Offer-SaveBackup($g) {
-    $r = [Windows.MessageBox]::Show("Keep your save games before removing $($g.Name)?`n`nYes = find the saves and back them up first (recommended)`nNo = remove the game without keeping saves`nCancel = stop", 'Repack Shelf', 'YesNoCancel', 'Question')
-    if ($r -eq 'Cancel') { return $false }
-    if ($r -eq 'No') { return $true }
-    $w.Cursor = 'Wait'; $w.Dispatcher.Invoke([action]{}, 'Render')
-    $c = @(Find-SaveCandidates $g)
-    $w.Cursor = $null
-    $d = Show-SaveDialog $g $c 'uninstall'
-    if ($d.Result -eq 'cancel') { return $false }
-    if ($d.Result -eq 'skip') { return $true }
-    if ($d.Items.Count -eq 0) { return (Ask 'Nothing is ticked, so no saves will be kept. Remove the game anyway?') }
-    $res = Backup-Saves $g $d.Items
-    if ($res.Failed -gt 0) { return (Ask "$($res.Failed) file(s) could not be copied (they may be in use). Remove the game anyway?") }
-    Tell "Saves backed up to:`n$($res.Dest)`n`nAfter you reinstall the game, select it and use Restore saved games."
-    $true
-}
-function Backup-Flow($g) {
-    $w.Cursor = 'Wait'; $w.Dispatcher.Invoke([action]{}, 'Render')
-    $c = @(Find-SaveCandidates $g)
-    $w.Cursor = $null
-    $d = Show-SaveDialog $g $c 'backup'
-    if ($d.Result -ne 'go') { return }
-    if ($d.Items.Count -eq 0) { Tell 'Nothing was ticked, so nothing was backed up.'; return }
-    $res = Backup-Saves $g $d.Items
-    $msg = "Saves backed up to:`n$($res.Dest)"; if ($res.Failed -gt 0) { $msg += "`n`n$($res.Failed) file(s) could not be copied (they may be in use)." }
-    Tell $msg
-    $btnRestore.Visibility = 'Visible'
-}
-function Restore-Flow($g) {
-    $bd = Get-LatestBackup $g
-    if (-not $bd) { Tell 'No backed-up saves were found for this game.'; return }
-    try { $man = Get-Content -LiteralPath (Join-Path $bd 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { Tell 'That backup could not be read.'; return }
-    $plan = @()
-    foreach ($it in @($man.items)) {
-        if ("$($it.Sub)" -notmatch '^\d+$') { continue }
-        $src = Join-Path $bd "$($it.Sub)"
-        if (-not (Test-Path -LiteralPath $src)) { continue }
-        $dst = if ("$($it.Kind)" -eq 'gamedir') { Join-Path $g.Dir "$($it.Rel)" } else { "$($it.Src)" }
-        if (Test-RestoreTarget $dst $g) { $plan += [pscustomobject]@{ Src = $src; Dst = $dst } }
-    }
-    if ($plan.Count -eq 0) { Tell 'Nothing in this backup can be restored to a safe location.'; return }
-    $when = try { ([datetime]"$($man.created)").ToString('d MMM yyyy HH:mm') } catch { 'an earlier date' }
-    if (-not (Ask "Restore the saved games for $($g.Name)?`n`nBackup from $when, $($plan.Count) folder(s). Files with the same names will be overwritten.`n`n$(($plan | ForEach-Object { $_.Dst }) -join "`n")")) { return }
-    $w.Cursor = 'Wait'; $w.Dispatcher.Invoke([action]{}, 'Render')
-    $failed = 0
-    foreach ($p in $plan) { $failed += [int](Copy-DirSafe $p.Src $p.Dst) }
-    $w.Cursor = $null
-    Write-Log "Saves restored for $($g.Name): $($plan.Count) folder(s), $failed failed"
-    Tell $(if ($failed -gt 0) { "Restored, but $failed file(s) could not be copied." } else { 'Your saved games were restored.' })
-}
-$btnSaves.Add_Click({ $g = $list.SelectedItem; if ($g) { Backup-Flow $g } })
-$btnRestore.Add_Click({ $g = $list.SelectedItem; if ($g) { Restore-Flow $g } })
 function Finish-Remove($i, $confirmed) {
     if (Test-Path -LiteralPath $i.Dir) {
         if (-not (Test-SafeDeleteTarget $i.Dir)) {
@@ -1240,7 +1322,7 @@ function Play {
     $g = $list.SelectedItem
     if (-not $g -or -not $g.Exe) { return }
     if (-not (Test-LocalExe $g.Exe)) { Tell 'That program is missing or is not on a local drive. Use Set .exe to choose it again.'; return }
-    try { Start-Process -FilePath $g.Exe -WorkingDirectory (Split-Path $g.Exe); $status.Text = "Launched $($g.Name)." } catch { Tell "Could not launch: $($_.Exception.Message)" }
+    try { Start-Process -FilePath $g.Exe -WorkingDirectory (Split-Path $g.Exe); $status.Text = $(if ($script:hw) { "Summoned $($g.Name)... good luck." } else { "Launched $($g.Name)." }); Play-Sfx 'launch'; Flash-Lightning } catch { Tell "Could not launch: $($_.Exception.Message)" }
 }
 
 function Check-Update($manual) {
@@ -1320,9 +1402,9 @@ function Install-Update {
 $script:upd = $null
 function Sync-Opts {
     $script:syncing = $true
-    $def = @{ theme = 'Dark'; size = 'Medium'; bg = 'Solid'; anim = 'Normal'; round = 'Soft'; online = 'On' }
-    foreach ($pair in @(@($optTheme, 'theme'), @($optSize, 'size'), @($optBg, 'bg'), @($optAnim, 'anim'), @($optRound, 'round'), @($optOnline, 'online'))) {
-        $v = "$($script:cfg['ui:' + $pair[1]])"; if (-not $v) { $v = $def[$pair[1]] }; if ($v -eq 'On') { $v = 'Normal' }
+    $def = @{ theme = 'Dark'; size = 'Medium'; bg = 'Solid'; anim = 'Normal'; round = 'Soft'; online = 'On'; halloween = 'On'; hwsound = 'On' }
+    foreach ($pair in @(@($optHw, 'halloween'), @($optHwSound, 'hwsound'), @($optTheme, 'theme'), @($optSize, 'size'), @($optBg, 'bg'), @($optAnim, 'anim'), @($optRound, 'round'), @($optOnline, 'online'))) {
+        $v = "$($script:cfg['ui:' + $pair[1]])"; if (-not $v) { $v = $def[$pair[1]] }; if ($v -eq 'On' -and $pair[1] -eq 'anim') { $v = 'Normal' }
         foreach ($rb in $pair[0].Children) { $rb.IsChecked = ($rb.Tag -eq $v) }
     }
     $acc = "$($script:cfg['ui:accent'])"; if (-not $acc) { $acc = '#60CDFF' }
@@ -1332,12 +1414,13 @@ function Sync-Opts {
 }
 function Opt-Changed($rb) {
     if ($script:syncing) { return }
-    $k = switch ($rb.Parent.Name) { 'optTheme' { 'theme' } 'optSize' { 'size' } 'optBg' { 'bg' } 'optRound' { 'round' } 'optOnline' { 'online' } default { 'anim' } }
+    $k = switch ($rb.Parent.Name) { 'optTheme' { 'theme' } 'optSize' { 'size' } 'optBg' { 'bg' } 'optRound' { 'round' } 'optOnline' { 'online' } 'optHw' { 'halloween' } 'optHwSound' { 'hwsound' } default { 'anim' } }
     $script:cfg["ui:$k"] = $rb.Tag; Save-Cfg; Apply-Theme; Fade $w.Content 0.9 240
     if ($k -eq 'size') { $list.UpdateLayout(); Animate-In }
+    if ($k -eq 'halloween' -and $rb.Tag -eq 'On') { Play-Sfx 'ghost'; Flash-Lightning }
     if ($k -eq 'online' -and $rb.Tag -eq 'On') { Scan-And-Show }
 }
-function Show-Settings { Sync-Opts; $settings.Visibility = 'Visible'; Anim-Slide $settings 'x' 380 380 }
+function Show-Settings { Sync-Opts; Play-Sfx 'creak'; $settings.Visibility = 'Visible'; Anim-Slide $settings 'x' 380 380 }
 function Hide-Settings {
     if (-not $script:animOn) { $settings.Visibility = 'Collapsed'; return }
     $tt = New-Object Windows.Media.TranslateTransform; $settings.RenderTransform = $tt
@@ -1446,7 +1529,7 @@ function Build-Storage {
     $note = New-StorText 'Nothing is deleted from here. Use "Uninstall completely" on a game to remove it.' 12 $true; $note.TextTrimming = 'None'; $note.TextWrapping = 'Wrap'; $note.Margin = [Windows.Thickness]::new(0, 6, 0, 0)
     [void]$storBody.Children.Add($note)
 }
-function Show-Storage { Build-Storage; $storage.Visibility = 'Visible'; Anim-Slide $storage 'x' 380 380 }
+function Show-Storage { Build-Storage; Play-Sfx 'creak'; $storage.Visibility = 'Visible'; Anim-Slide $storage 'x' 380 380 }
 function Hide-Storage {
     if (-not $script:animOn) { $storage.Visibility = 'Collapsed'; return }
     $tt = New-Object Windows.Media.TranslateTransform; $storage.RenderTransform = $tt
@@ -1460,7 +1543,7 @@ foreach ($hex in $Accents) {
     $b.Add_Click({ $script:cfg['ui:accent'] = $args[0].Tag; Save-Cfg; Apply-Theme; Sync-Opts })
     [void]$swatches.Children.Add($b)
 }
-foreach ($p in $optTheme, $optSize, $optBg, $optAnim, $optRound, $optOnline) { foreach ($rb in $p.Children) { $rb.Add_Checked({ Opt-Changed $args[0] }) } }
+foreach ($p in $optHw, $optHwSound, $optTheme, $optSize, $optBg, $optAnim, $optRound, $optOnline) { foreach ($rb in $p.Children) { $rb.Add_Checked({ Opt-Changed $args[0] }) } }
 $btnCustom.Add_Click({ if ($storage.Visibility -eq 'Visible') { Hide-Storage; Show-Settings } elseif ($settings.Visibility -eq 'Visible') { Hide-Settings } else { Show-Settings } })
 $btnStor.Add_Click({ Hide-Settings; Show-Storage })
 $btnCloseStor.Add_Click({ Hide-Storage })
@@ -1471,7 +1554,7 @@ $btnHex.Add_Click({
     $script:cfg['ui:accent'] = $h.ToUpper(); Save-Cfg; Apply-Theme; Sync-Opts
 })
 $btnReset.Add_Click({
-    foreach ($k in 'ui:theme', 'ui:accent', 'ui:size', 'ui:bg', 'ui:anim', 'ui:round', 'ui:online') { $script:cfg.Remove($k) }
+    foreach ($k in 'ui:theme', 'ui:accent', 'ui:size', 'ui:bg', 'ui:anim', 'ui:round', 'ui:online', 'ui:halloween', 'ui:hwsound') { $script:cfg.Remove($k) }
     Save-Cfg; Apply-Theme; Sync-Opts; Fade $w.Content 0.9 240
 })
 
@@ -1482,7 +1565,7 @@ $pump.Add_Tick({
         if ($m.T -eq 'update') { Show-Update $m; continue }
         $g = $script:byKey[$m.K]; if (-not $g) { continue }
         if ($m.T -eq 'cover') { $g.Cover = Load-Img $m.V; if ($m.Id) { $script:cfg["app:$($m.K)"] = "$($m.Id)" } }
-        elseif ($m.T -eq 'size') { $g.Bytes = [long]$m.V; $g.Size = Fmt $m.V; $script:storDirty = $true }
+        elseif ($m.T -eq 'size') { $g.Bytes = [long]$m.V; $g.Size = Fmt $m.V; $script:storDirty = $true; $script:cfg["szat:$($m.K)"] = "$([DateTime]::UtcNow.Ticks)"; $script:cfgDirty = $true }
         elseif ($m.T -eq 'genre') {
             if ($m.Id) { $script:cfg["app:$($m.K)"] = "$($m.Id)" }
             if ($null -ne $m.V) { $gv = "$($m.V)"; $script:cfg["gen:$($m.K)"] = $(if ($gv) { $gv } else { '-' }); if ($gv) { $g.Genres = $gv; $script:genDirty = $true } }
@@ -1517,11 +1600,11 @@ $list.Add_SelectionChanged({
     if (-not $g) { return }
     $detail.DataContext = $g; $empty.Visibility = 'Collapsed'; $detail.Visibility = 'Visible'
     $btnPlay.IsEnabled = [bool]$g.Exe
-    $btnRestore.Visibility = if (Get-LatestBackup $g) { 'Visible' } else { 'Collapsed' }
     $btnNotes.Content = if ($g.HasUpd -and $g.NewsUrl) { 'Read latest patch notes' } elseif ("$($script:cfg['app:' + $g.Key])" -match '^\d+$') { 'Official patch notes (Steam)' } else { 'Find on Steam' }
     $btnSeen.Visibility = if ($g.HasUpd) { 'Visible' } else { 'Collapsed' }
     $btnUn.Content = if ($g.UnExe -or $g.KeyPath) { 'Uninstall completely' } else { 'Delete game folder' }
     Anim-Slide $detail 'x' 28 330; Stagger-Detail
+    if ($list.IsMouseOver -or $list.IsKeyboardFocusWithin) { Play-Sfx 'select' }
 })
 $list.Add_MouseDoubleClick({ Play })
 $script:searchTimer = New-Object Windows.Threading.DispatcherTimer; $script:searchTimer.Interval = [TimeSpan]::FromMilliseconds(200)
@@ -1594,7 +1677,7 @@ $btnSeen.Add_Click({
 })
 function Save-Fav($g) {
     if (-not $g) { return }
-    $k = "fav:$($g.Key)"; if ($g.Fav) { $script:cfg[$k] = $true } else { $script:cfg.Remove($k) }
+    $k = "fav:$($g.Key)"; if ($g.Fav) { $script:cfg[$k] = $true; Play-Sfx 'fav' } else { $script:cfg.Remove($k) }
     Save-Cfg
     if ($script:favOnly) { Refresh-List $true }
 }
@@ -1609,7 +1692,7 @@ $btnNotes.Add_Click({
     if ($g.HasUpd -and $g.NewsUrl) { Open-SafeUrl $g.NewsUrl $hub } else { Open-SafeUrl $hub }
 })
 $btnScan.ToolTip = 'Click: quick refresh. Shift+click: full rescan.'
-$btnScan.Add_Click({ Scan-And-Show (([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift) -ne 0) })
+$btnScan.Add_Click({ Play-Sfx 'thunder'; Flash-Lightning; $script:forceSizes = $true; Scan-And-Show (([Windows.Input.Keyboard]::Modifiers -band [Windows.Input.ModifierKeys]::Shift) -ne 0) })
 $btnUpdate.Add_Click({ Check-Update $true })
 $btnUpd.Add_Click({ Install-Update })
 $btnLater.Add_Click({ $updBar.Visibility = 'Collapsed' })
@@ -1652,7 +1735,6 @@ $btnUn.Add_Click({
     if ($i.UnExe -and (Test-LocalPath $i.UnExe) -and (Test-Path -LiteralPath $i.UnExe)) {
         $warn = if (Test-InnoUninstaller $i.UnExe) { '' } else { "`n`nWARNING: this file does not look like a genuine Inno Setup uninstaller. Running it runs whatever the file contains." }
         if (-not (Ask "Uninstall $($i.Name)?`n`nUninstaller: $($i.UnExe)$warn`n`nIts own uninstaller runs first, then leftover files in`n$($i.Dir)`ncan be removed. Save games outside that folder are not touched.")) { return }
-        if (-not (Offer-SaveBackup $i)) { return }
         Start-Process -FilePath $i.UnExe -WorkingDirectory (Split-Path $i.UnExe)
         $status.Text = 'Waiting for the uninstaller to finish...'
         $script:unI = $i; $script:unT0 = Get-Date
@@ -1665,7 +1747,7 @@ $btnUn.Add_Click({
         })
         $t.Start()
     } elseif (-not (Test-SafeDeleteTarget $i.Dir)) { Tell "$($i.Name) has no uninstaller, and Repack Shelf will not delete this folder because it looks like a system, personal or library folder:`n$($i.Dir)"
-    } elseif (Ask "$($i.Name) has no uninstaller.`n`nPermanently delete its folder ($(Fmt (Get-DirSize $i.Dir)))?`n$($i.Dir)`n`nAnything stored inside, such as saves or mods, will be lost.") { if (Offer-SaveBackup $i) { Finish-Remove $i $true } }
+    } elseif (Ask "$($i.Name) has no uninstaller.`n`nPermanently delete its folder ($(Fmt (Get-DirSize $i.Dir)))?`n$($i.Dir)`n`nAnything stored inside, such as saves or mods, will be lost.") { Finish-Remove $i $true }
 })
 
 # ---------- smooth wheel scrolling ----------
@@ -1709,6 +1791,7 @@ $w.Add_SourceInitialized({ Set-TitleBar })
 $w.Add_ContentRendered({ if (-not $script:started) { $script:started = $true
     $n = 0; foreach ($c in $w.Content.Children[0].Children) { Anim-Slide $c 'y' -14 420 ($n * 70); $n++ }
     Init-Toolbar
+    Update-Halloween; Play-Sfx 'boot'; Flash-Lightning
     Load-Library
     Rebuild-Cats; Refresh-UpdChip
     if ($script:games.Count) { Refresh-List; $status.Text = "Loaded $($script:games.Count) game(s). Checking for changes..."; $w.Dispatcher.Invoke([action]{}, 'Render') }
